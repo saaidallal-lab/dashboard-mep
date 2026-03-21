@@ -1,0 +1,15 @@
+# Secrets Firebase - NE JAMAIS COMMITTER
+firebase-key.json
+
+# Environnement virtuel
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Fichier Excel (données locales)
+*.xlsx
+
+# Fichiers temporaires
+.DS_Store
+*.log
