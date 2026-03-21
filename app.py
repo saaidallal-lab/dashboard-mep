@@ -17,7 +17,7 @@ FIRESTORE_COLLECTION = "kpi_2026"
 def _get_firestore_client():
     try:
         # Streamlit Cloud : credentials dans st.secrets
-        key_dict = dict(st.secrets["firebase"])
+        key_dict = dict(st.secrets["gcp_service_account"])
         creds = service_account.Credentials.from_service_account_info(key_dict)
         return firestore.Client(project=key_dict["project_id"], credentials=creds)
     except Exception:
