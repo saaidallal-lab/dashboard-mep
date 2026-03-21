@@ -5,6 +5,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import plotly.io as pio
 import os
+import base64
 from google.cloud import firestore
 from google.oauth2 import service_account
 import json
@@ -15,16 +16,43 @@ warnings.filterwarnings('ignore')
 FIRESTORE_COLLECTION = "kpi_2026"
 
 def _get_firestore_client():
-    try:
-        # Streamlit Cloud : credentials dans st.secrets
-        key_dict = dict(st.secrets["gcp_service_account"])
-        creds = service_account.Credentials.from_service_account_info(key_dict)
-        return firestore.Client(project=key_dict["project_id"], credentials=creds)
-    except Exception:
-        # Dev local : fichier firebase-key.json
-        key_path = os.path.join(os.path.dirname(__file__), "firebase-key.json")
+    """
+    Authentification Firestore avec 3 stratégies :
+    1. FIREBASE_CREDENTIALS (base64 du JSON) — le plus simple à coller dans Streamlit Cloud
+    2. [gcp_service_account] en TOML dans st.secrets
+    3. Fichier firebase-key.json local (dev)
+    """
+    import traceback
+
+    # Méthode 1 : base64 (une seule ligne, facile à coller)
+    if "FIREBASE_CREDENTIALS" in st.secrets:
+        try:
+            creds_json = base64.b64decode(st.secrets["FIREBASE_CREDENTIALS"]).decode("utf-8")
+            key_dict = json.loads(creds_json)
+            creds = service_account.Credentials.from_service_account_info(key_dict)
+            return firestore.Client(project=key_dict["project_id"], credentials=creds)
+        except Exception:
+            pass
+
+    # Méthode 2 : TOML [gcp_service_account] dans st.secrets
+    if "gcp_service_account" in st.secrets:
+        try:
+            key_dict = json.loads(json.dumps(dict(st.secrets["gcp_service_account"])))
+            creds = service_account.Credentials.from_service_account_info(key_dict)
+            return firestore.Client(project=key_dict["project_id"], credentials=creds)
+        except Exception:
+            pass
+
+    # Méthode 3 : fichier local (dev)
+    key_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "firebase-key.json")
+    if os.path.exists(key_path):
         os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = key_path
         return firestore.Client()
+
+    raise RuntimeError(
+        "Impossible de se connecter à Firestore. "
+        "Configurez FIREBASE_CREDENTIALS (base64) dans les secrets Streamlit Cloud."
+    )
 
 _db = _get_firestore_client()
 
