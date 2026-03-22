@@ -24,24 +24,27 @@ def _get_firestore_client():
     """
     import traceback
 
-    # Méthode 1 : base64 (une seule ligne, facile à coller)
-    if "FIREBASE_CREDENTIALS" in st.secrets:
-        try:
-            creds_json = base64.b64decode(st.secrets["FIREBASE_CREDENTIALS"]).decode("utf-8")
-            key_dict = json.loads(creds_json)
-            creds = service_account.Credentials.from_service_account_info(key_dict)
-            return firestore.Client(project=key_dict["project_id"], credentials=creds)
-        except Exception:
-            pass
+    try:
+        # Méthode 1 : base64 (une seule ligne, facile à coller)
+        if "FIREBASE_CREDENTIALS" in st.secrets:
+            try:
+                creds_json = base64.b64decode(st.secrets["FIREBASE_CREDENTIALS"]).decode("utf-8")
+                key_dict = json.loads(creds_json)
+                creds = service_account.Credentials.from_service_account_info(key_dict)
+                return firestore.Client(project=key_dict["project_id"], credentials=creds)
+            except Exception:
+                pass
 
-    # Méthode 2 : TOML [gcp_service_account] dans st.secrets
-    if "gcp_service_account" in st.secrets:
-        try:
-            key_dict = json.loads(json.dumps(dict(st.secrets["gcp_service_account"])))
-            creds = service_account.Credentials.from_service_account_info(key_dict)
-            return firestore.Client(project=key_dict["project_id"], credentials=creds)
-        except Exception:
-            pass
+        # Méthode 2 : TOML [gcp_service_account] dans st.secrets
+        if "gcp_service_account" in st.secrets:
+            try:
+                key_dict = json.loads(json.dumps(dict(st.secrets["gcp_service_account"])))
+                creds = service_account.Credentials.from_service_account_info(key_dict)
+                return firestore.Client(project=key_dict["project_id"], credentials=creds)
+            except Exception:
+                pass
+    except Exception:
+        pass
 
     # Méthode 3 : fichier local (dev)
     key_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "firebase-key.json")
@@ -125,21 +128,34 @@ def load_data():
         'Mix KG/H': 'Mix_kg_h',
         'Mélange KG/H': 'Mélange_kg_h',
         'Kg/H ': 'Global_kg_h',
-        '€/kg (Mep global)': 'Euro_kilo_global'
+        '€/kg (Mep global)': 'Euro_kilo_global',
+        'Heures Désinfection': 'Désinfection',
+        'Heures Traçabilité': 'Traçabilité',
+        'Heures CF tampon': 'CF tampon',
+        'Désinfection KG/H': 'Désinfection_kg_h',
+        'Traçabilité KG/H': 'Traçabilité_kg_h',
+        'CF tampon KG/H': 'CF tampon_kg_h'
     }
     df = df.rename(columns=mapping)
+    
+    # Sécurisation : retirer les colonnes dupliquées dues au renommage (ex: si le raw contenait déjà 'Désinfection_kg_h' et 'Désinfection KG/H')
+    df = df.loc[:, ~df.columns.duplicated()]
 
     # Nettoyage : On ne garde que les lignes où 'Semaine' est un nombre
     df['Semaine'] = pd.to_numeric(df['Semaine'], errors='coerce')
 
     # Conversion en numérique pour être sûr des calculs
-    cols_to_fix = ['Semaine', 'Total heure', 'Chaud', 'Légumerie', 'Sushi', 'Découpe', 'Mix', 'Mélange', 'UVC/H par ETP',
-                   'Chaud_kg_h', 'Légumerie_kg_h', 'Découpe_kg_h', 'Sushi_kg_h', 'Mix_kg_h', 'Mélange_kg_h', 'Global_kg_h', 'Kg produits global']
+    cols_to_fix = ['Semaine', 'Total heure', 'Chaud', 'Légumerie', 'Sushi', 'Découpe', 'Mix', 'Mélange', 
+                   'Désinfection', 'Traçabilité', 'CF tampon', 'UVC/H par ETP',
+                   'Chaud_kg_h', 'Légumerie_kg_h', 'Découpe_kg_h', 'Sushi_kg_h', 'Mix_kg_h', 'Mélange_kg_h', 
+                   'Désinfection_kg_h', 'Traçabilité_kg_h', 'CF tampon_kg_h',
+                   'Global_kg_h', 'Kg produits global', 'Euro_kilo_global', 'Commandes']
     for col in cols_to_fix:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
+        if col not in df.columns:
+            df[col] = 0.0
+        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
 
-    return df.dropna(subset=['Semaine']).sort_values('Semaine')
+    return df.dropna(subset=['Semaine']).sort_values('Semaine').reset_index(drop=True)
 
 # --- CHARGEMENT DES DONNÉES ---
 try:
@@ -158,8 +174,11 @@ POSTES_EMOJIS = {
     "Légumerie": "🥦 Légumerie",
     "Sushi": "🍣 Sushi",
     "Découpe": "🔪 Découpe",
-    "Mix": "🌪️ Mix",
+    "Mix": "🥣 Mix",
     "Mélange": "🥄 Mélange",
+    "Désinfection": "🧼 Désinfection",
+    "Traçabilité": "📋 Traçabilité",
+    "CF tampon": "❄️ CF tampon",
     "Saisie de données": "✏️ Saisie de données"
 }
 
@@ -183,7 +202,10 @@ COULEURS_POSTES = {
     'Sushi': '#7eb0d5',      # Bleu pastel
     'Découpe': '#bd7ebe',    # Violet pastel
     'Mix': '#ffb55a',        # Orange pastel
-    'Mélange': '#ffee65'     # Jaune pastel
+    'Mélange': '#ffee65',    # Jaune pastel
+    'Désinfection': '#8dd3c7',# Cyan pastel
+    'Traçabilité': '#bebada', # Violet clair pastel
+    'CF tampon': '#80b1d3'    # Bleu acier pastel
 }
 
 COULEURS_POSTES_FONCEES = {
@@ -192,7 +214,10 @@ COULEURS_POSTES_FONCEES = {
     'Sushi': '#2d6a9f',
     'Découpe': '#814a81',
     'Mix': '#cc7a18',
-    'Mélange': '#a69a19'
+    'Mélange': '#a69a19',
+    'Désinfection': '#1b9e77',
+    'Traçabilité': '#7570b3',
+    'CF tampon': '#377eb8'
 }
 
 # --- BARRE LATÉRALE (NAVIGATION) ---
@@ -260,100 +285,102 @@ if page == "Dashboard Global":
 
         st.markdown("---")
         
-        col_gauche, col_droite = st.columns([2, 1])
+        # Graphique de tendance combiné (6 dernières semaines)
+        st.subheader(f"Comparaison Kilos vs Productivité (jusqu'à S{int(latest_week['Semaine'])})")
         
-        with col_gauche:
-            # Graphique de tendance combiné (6 dernières semaines)
-            st.subheader(f"Comparaison Kilos vs Productivité (jusqu'à S{int(latest_week['Semaine'])})")
-            
-            fig = make_subplots(specs=[[{"secondary_y": True}]])
-            
-            # Axe 1 : Kilos (Barres)
-            fig.add_trace(
-                go.Bar(
-                    x=last_6_weeks['Semaine'], 
-                    y=last_6_weeks['Kg produits global'], 
-                    name="Total Kilos", 
-                    marker_color='#1f77b4',
-                    text=last_6_weeks['Kg produits global'].fillna(0).round(0).astype(int).astype(str) + " <i>kg</i>",
-                    textposition='inside',
-                    insidetextanchor='middle',
-                    textfont=dict(color='white', weight='bold')
-                ),
-                secondary_y=False,
-            )
-            
-            # Axe 2 : Kg/H (Ligne)
-            fig.add_trace(
-                go.Scatter(
-                    x=last_6_weeks['Semaine'], 
-                    y=last_6_weeks['Global_kg_h'], 
-                    name="Kg/H Global", 
-                    line=dict(color='#ff7f0e', width=3),
-                    mode='lines+markers+text',
-                    text=last_6_weeks['Global_kg_h'].round(1).astype(str) + " <i>kg/h</i>",
-                    textposition='top center',
-                    textfont=dict(weight='bold', size=13, color='#ffe0b2')
-                ),
-                secondary_y=True,
-            )
-            
-            # Axe 2 : Objectif Kg/H (Ligne pointillée)
-            val_etape1_g = OBJECTIFS_KGH_ETAPE1['Global']
-            fig.add_trace(
-                go.Scatter(
-                    x=[last_6_weeks['Semaine'].min(), last_6_weeks['Semaine'].max()],
-                    y=[val_etape1_g, val_etape1_g],
-                    name="Objectif Kg/H (Étape 1)",
-                    mode='lines',
-                    line=dict(color='#ff7f0e', dash='dash', width=2)
-                ),
-                secondary_y=True,
-            )
-            
-            fig.update_layout(
-                xaxis_title="Semaine",
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-            )
-            # Échelles personnalisées pour le graphique global
-            fig.update_yaxes(title_text="Kilos", secondary_y=False, range=[0, 60000])
-            max_y2 = max(last_6_weeks['Global_kg_h'].max() * 1.2, OBJECTIFS_KGH_ETAPE1['Global'] * 1.2, 50)
-            fig.update_yaxes(title_text="Kg/H", secondary_y=True, range=[0, max_y2])
-            
-            st.plotly_chart(fig, use_container_width=True)
+        fig = make_subplots(specs=[[{"secondary_y": True}]])
+        
+        # Axe 1 : Kilos (Barres)
+        fig.add_trace(
+            go.Bar(
+                x=last_6_weeks['Semaine'], 
+                y=last_6_weeks['Kg produits global'], 
+                name="Total Kilos", 
+                marker_color='#1f77b4',
+                text=last_6_weeks['Kg produits global'].fillna(0).round(0).astype(int).astype(str) + " <i>kg</i>",
+                textposition='inside',
+                insidetextanchor='middle',
+                textfont=dict(color='white', weight='bold')
+            ),
+            secondary_y=False,
+        )
+        
+        # Axe 2 : Kg/H (Ligne)
+        fig.add_trace(
+            go.Scatter(
+                x=last_6_weeks['Semaine'], 
+                y=last_6_weeks['Global_kg_h'], 
+                name="Kg/H Global", 
+                line=dict(color='#ff7f0e', width=3),
+                mode='lines+markers+text',
+                text=last_6_weeks['Global_kg_h'].round(1).astype(str) + " <i>kg/h</i>",
+                textposition='top center',
+                textfont=dict(weight='bold', size=13, color='#ffe0b2')
+            ),
+            secondary_y=True,
+        )
+        
+        # Axe 2 : Objectif Kg/H (Ligne pointillée)
+        val_etape1_g = OBJECTIFS_KGH_ETAPE1['Global']
+        fig.add_trace(
+            go.Scatter(
+                x=[last_6_weeks['Semaine'].min(), last_6_weeks['Semaine'].max()],
+                y=[val_etape1_g, val_etape1_g],
+                name="Objectif Kg/H (Étape 1)",
+                mode='lines',
+                line=dict(color='#ff7f0e', dash='dash', width=2)
+            ),
+            secondary_y=True,
+        )
+        
+        fig.update_layout(
+            xaxis_title="Semaine",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
+        # Échelles personnalisées pour le graphique global
+        fig.update_yaxes(title_text="Kilos", secondary_y=False, range=[0, 60000])
+        max_y2 = max(last_6_weeks['Global_kg_h'].max() * 1.2, OBJECTIFS_KGH_ETAPE1['Global'] * 1.2, 50)
+        fig.update_yaxes(title_text="Kg/H", secondary_y=True, range=[0, max_y2])
+        
+        st.plotly_chart(fig, use_container_width=True)
 
-        with col_droite:
-            # Graphique donut pour la répartition par poste
-            st.subheader(f"Répartition des heures (S{int(latest_week['Semaine'])})")
-            
-            postes = ['Chaud', 'Légumerie', 'Sushi', 'Découpe', 'Mix', 'Mélange']
-            heures_postes = []
-            labels_postes = []
-            for p in postes:
-                h_val = latest_week[p] if p in latest_week and pd.notna(latest_week[p]) else 0
-                h_prev = prev_week[p] if prev_week is not None and p in prev_week else None
-                delta_str = ""
-                delta_val = calculate_delta(h_val, h_prev)
-                if delta_val is not None:
-                    # Plus pour positif
-                    sign = "+" if delta_val > 0 else ""
-                    delta_str = f" ({sign}{delta_val:.1f}%)"
-                    
-                heures_postes.append(h_val)
-                # On ajoute l'emoji au label pour la gamification
-                label_with_emoji = POSTES_EMOJIS.get(p, p)
-                labels_postes.append(f"{label_with_emoji}{delta_str}")
-            
-            couleurs_pie = [COULEURS_POSTES.get(p, '#ccc') for p in postes]
-            fig_pie = go.Figure(data=[go.Pie(
-                labels=labels_postes,
-                values=heures_postes,
-                hole=0.4,
-                textinfo='label+percent',
-                marker=dict(colors=couleurs_pie)
-            )])
-            fig_pie.update_layout(showlegend=True, margin=dict(t=30, b=0, l=0, r=0), 
-                                  legend=dict(orientation="h", yanchor="bottom", y=-0.3, xanchor="center", x=0.5))
+        st.markdown("---")
+
+        # Graphique donut pour la répartition par poste
+        st.subheader(f"Répartition des heures (S{int(latest_week['Semaine'])})")
+        
+        postes = ['Chaud', 'Légumerie', 'Sushi', 'Découpe', 'Mix', 'Mélange', 'Désinfection', 'Traçabilité', 'CF tampon']
+        heures_postes = []
+        labels_postes = []
+        for p in postes:
+            h_val = latest_week[p] if p in latest_week and pd.notna(latest_week[p]) else 0
+            h_prev = prev_week[p] if prev_week is not None and p in prev_week else None
+            delta_str = ""
+            delta_val = calculate_delta(h_val, h_prev)
+            if delta_val is not None:
+                # Plus pour positif
+                sign = "+" if delta_val > 0 else ""
+                delta_str = f" ({sign}{delta_val:.1f}%)"
+                
+            heures_postes.append(h_val)
+            # On ajoute l'emoji au label pour la gamification
+            label_with_emoji = POSTES_EMOJIS.get(p, p)
+            labels_postes.append(f"{label_with_emoji}{delta_str}")
+        
+        couleurs_pie = [COULEURS_POSTES.get(p, '#ccc') for p in postes]
+        fig_pie = go.Figure(data=[go.Pie(
+            labels=labels_postes,
+            values=heures_postes,
+            hole=0.4,
+            textinfo='label+percent',
+            textposition='inside',
+            marker=dict(colors=couleurs_pie)
+        )])
+        fig_pie.update_layout(showlegend=True, margin=dict(t=30, b=0, l=0, r=0), 
+                              legend=dict(orientation="h", yanchor="bottom", y=-0.3, xanchor="center", x=0.5))
+        
+        col_pie_spacer1, col_pie, col_pie_spacer2 = st.columns([1, 2, 1])
+        with col_pie:
             st.plotly_chart(fig_pie, use_container_width=True)
 
         # Graphique Évolution Euro/Kilo vs Kilos Produits
@@ -443,7 +470,7 @@ if page == "Dashboard Global":
                 ref_week = ref_semaine_df.iloc[0] if not ref_semaine_df.empty else None
                 ref_lbl = "un mois (S-4)"
                 
-            postes = ['Chaud', 'Légumerie', 'Sushi', 'Découpe', 'Mix', 'Mélange']
+            postes = ['Chaud', 'Légumerie', 'Sushi', 'Découpe', 'Mix', 'Mélange', 'Désinfection', 'Traçabilité', 'CF tampon']
             
             if ref_week is not None:
                 perfs_heures = []
@@ -492,7 +519,7 @@ if page == "Dashboard Global":
         st.info("Aucune donnée disponible. Veuillez saisir des données dans la section 'Saisie de données'.")
 
 # --- PAGES PAR POSTE (MODULAIRE) ---
-elif page in ["Chaud", "Légumerie", "Sushi", "Découpe", "Mix", "Mélange"]:
+elif page in ["Chaud", "Légumerie", "Sushi", "Découpe", "Mix", "Mélange", "Désinfection", "Traçabilité", "CF tampon"]:
     st.title(f"{POSTES_EMOJIS.get(page, page)}")
     
     if latest_week is not None:
@@ -561,7 +588,10 @@ elif page in ["Chaud", "Légumerie", "Sushi", "Découpe", "Mix", "Mélange"]:
                     'Sushi': '#133554',
                     'Découpe': '#452345',
                     'Mix': '#7a4608',
-                    'Mélange': '#524b07'
+                    'Mélange': '#524b07',
+                    'Désinfection': '#0f5c45',
+                    'Traçabilité': '#413e66',
+                    'CF tampon': '#1f4a6b'
                 }
                 c_texte_fonce = COULEURS_TEXTES_FONCEES.get(page, '#000000')
 
@@ -633,52 +663,81 @@ elif page in ["Chaud", "Légumerie", "Sushi", "Découpe", "Mix", "Mélange"]:
 # --- PAGE DE SAISIE (PORTE OUVERTE) ---
 elif page == "Saisie de données":
     st.title("📝 Saisie de données")
-    st.info("La saisie est actuellement désactivée pendant la migration vers le format Excel 2026. Veuillez modifier directement le fichier Excel pour le moment.")
     
+    st.subheader("➕ Ajouter ou modifier une semaine")
     with st.form("new_data_form"):
         # Valeur par défaut pour la nouvelle semaine
         default_semaine = int(latest_week['Semaine']) + 1 if latest_week is not None else 1
         
-        col_s, col_c = st.columns(2)
+        col_s, col_k, col_t = st.columns(3)
         with col_s:
             new_semaine = st.number_input("Numéro de la semaine", min_value=1, max_value=53, value=default_semaine)
-        with col_c:
-            new_commandes = st.number_input("Nombre de commandes", min_value=0)
+        with col_k:
+            new_kilos = st.number_input("Kilos produits (total)", min_value=0.0, step=10.0)
+        with col_t:
+            new_taux = st.number_input("Taux horaire (€/h)", min_value=0.0, step=0.5, value=25.0)
             
         st.subheader("Heures consommées par poste")
         col1, col2, col3 = st.columns(3)
         with col1:
             new_chaud = st.number_input(f"{POSTES_EMOJIS['Chaud']} Heures", min_value=0.0, step=0.5)
             new_leg = st.number_input(f"{POSTES_EMOJIS['Légumerie']} Heures", min_value=0.0, step=0.5)
+            new_desinfection = st.number_input(f"{POSTES_EMOJIS['Désinfection']} Heures", min_value=0.0, step=0.5)
         with col2:
             new_sushi = st.number_input(f"{POSTES_EMOJIS['Sushi']} Heures", min_value=0.0, step=0.5)
             new_decoupe = st.number_input(f"{POSTES_EMOJIS['Découpe']} Heures", min_value=0.0, step=0.5)
+            new_tracabilite = st.number_input(f"{POSTES_EMOJIS['Traçabilité']} Heures", min_value=0.0, step=0.5)
         with col3:
             new_mix = st.number_input(f"{POSTES_EMOJIS['Mix']} Heures", min_value=0.0, step=0.5)
             new_melange = st.number_input(f"{POSTES_EMOJIS['Mélange']} Heures", min_value=0.0, step=0.5)
+            new_cf_tampon = st.number_input(f"{POSTES_EMOJIS['CF tampon']} Heures", min_value=0.0, step=0.5)
+        
+        # Calcul dynamique avant la soumission pour l'affichage
+        total_heure = new_chaud + new_leg + new_sushi + new_decoupe + new_mix + new_melange + new_desinfection + new_tracabilite + new_cf_tampon
+        st.info(f"⏱️ **Total des heures renseignées : {total_heure} h**")
         
         submitted = st.form_submit_button("Enregistrer la semaine")
         if submitted:
-            # Calculs automatiques des champs
-            total_heure = new_chaud + new_leg + new_sushi + new_decoupe + new_mix + new_melange
-            
-            # On prépare la nouvelle ligne de données
-            new_row = pd.DataFrame([{
-                'Semaine': new_semaine,
-                'Commandes': new_commandes,
-                'Total heure': total_heure,
-                'Chaud': new_chaud,
-                'Légumerie': new_leg,
-                'Sushi': new_sushi,
-                'Découpe': new_decoupe,
-                'Mix': new_mix,
-                'Mélange': new_melange,
-                'UVC/H par ETP': 0.0 # Optionnel : À calculer selon vos règles métiers
-            }])
+            # Utiliser les noms de colonnes originaux Firestore
+            doc_data = {
+                'Semaine': int(new_semaine),
+                'Total heure': float(total_heure),
+                'Heures Chaud': float(new_chaud),
+                'Heures Légumerie': float(new_leg),
+                'Heure Sushi': float(new_sushi),
+                'Heures Découpe': float(new_decoupe),
+                'Heures Mix': float(new_mix),
+                'Heures Mélange': float(new_melange),
+                'Heures Désinfection': float(new_desinfection),
+                'Heures Traçabilité': float(new_tracabilite),
+                'Heures CF tampon': float(new_cf_tampon),
+                
+                # Nouveaux champs saisis & stockés
+                'Kg produits global': float(new_kilos),
+                'Taux horaire': float(new_taux),
+                
+                # Productivité globale
+                'Kg/H ': float(new_kilos / total_heure) if total_heure > 0 else 0.0,
+                '€/kg (Mep global)': float((total_heure * new_taux) / new_kilos) if new_kilos > 0 else 0.0,
+                
+                # Productivité par poste
+                'Chaud kg/H': float(new_kilos / new_chaud) if new_chaud > 0 else 0.0,
+                'Légumerie KG/H': float(new_kilos / new_leg) if new_leg > 0 else 0.0,
+                'Découpe KG/H': float(new_kilos / new_decoupe) if new_decoupe > 0 else 0.0,
+                'Kg/H Sushi': float(new_kilos / new_sushi) if new_sushi > 0 else 0.0,
+                'Mix KG/H': float(new_kilos / new_mix) if new_mix > 0 else 0.0,
+                'Mélange KG/H': float(new_kilos / new_melange) if new_melange > 0 else 0.0,
+                'Désinfection KG/H': float(new_kilos / new_desinfection) if new_desinfection > 0 else 0.0,
+                'Traçabilité KG/H': float(new_kilos / new_tracabilite) if new_tracabilite > 0 else 0.0,
+                'CF tampon KG/H': float(new_kilos / new_cf_tampon) if new_cf_tampon > 0 else 0.0,
+                
+                # Ancien champ conservé à 0 pour la compatibilité
+                'Commandes': 0,
+                'UVC/H par ETP': 0.0
+            }
             
             # --- Sauvegarde dans Firestore ---
             doc_id = str(int(new_semaine))
-            doc_data = new_row.iloc[0].to_dict()
             _db.collection(FIRESTORE_COLLECTION).document(doc_id).set(doc_data)
 
             # Vider le cache pour forcer le rechargement des données sur le dashboard
@@ -686,3 +745,17 @@ elif page == "Saisie de données":
 
             st.success(f"✅ Données pour la S{int(new_semaine)} enregistrées avec succès dans Firestore !")
             st.info("Retournez sur le 'Dashboard Global' pour voir la mise à jour.")
+
+    st.divider()
+    st.subheader("🗑️ Supprimer une semaine")
+    with st.expander("Voir les options de suppression", expanded=False):
+        exist_weeks = sorted(data['Semaine'].dropna().unique().astype(int).tolist()) if not data.empty else []
+        if exist_weeks:
+            semaine_a_supprimer = st.selectbox("Choisir la semaine à supprimer", options=exist_weeks)
+            if st.button("Confirmer la suppression", type="primary"):
+                _db.collection(FIRESTORE_COLLECTION).document(str(semaine_a_supprimer)).delete()
+                st.cache_data.clear()
+                st.success(f"Semaine {semaine_a_supprimer} supprimée avec succès !")
+                st.rerun()
+        else:
+            st.info("Aucune semaine disponible à supprimer.")
