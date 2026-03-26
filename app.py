@@ -149,7 +149,7 @@ def load_data():
                    'Désinfection', 'Traçabilité', 'CF tampon', 'UVC/H par ETP',
                    'Chaud_kg_h', 'Légumerie_kg_h', 'Découpe_kg_h', 'Sushi_kg_h', 'Mix_kg_h', 'Mélange_kg_h', 
                    'Désinfection_kg_h', 'Traçabilité_kg_h', 'CF tampon_kg_h',
-                   'Global_kg_h', 'Kg produits global', 'Euro_kilo_global', 'Commandes']
+                   'Global_kg_h', 'Kg produits global', 'Kg Sushi', 'Euro_kilo_global', 'Commandes']
     for col in cols_to_fix:
         if col not in df.columns:
             df[col] = 0.0
@@ -220,6 +220,62 @@ COULEURS_POSTES_FONCEES = {
     'CF tampon': '#377eb8'
 }
 
+def _progress_bar_html(pct_achieved, label="🎯 Obj.", suffix=""):
+    """Barre de progression colorée selon le % atteint (rouge→orange→vert)."""
+    pct_display = min(max(pct_achieved, 0), 100)
+    if pct_achieved >= 100:
+        color, status = "#27ae60", "✅ Atteint !"
+    elif pct_achieved >= 80:
+        color, status = "#f1c40f", f"{pct_achieved:.0f}%{suffix}"
+    elif pct_achieved >= 60:
+        color, status = "#f39c12", f"{pct_achieved:.0f}%{suffix}"
+    else:
+        color, status = "#e74c3c", f"{pct_achieved:.0f}%{suffix}"
+    return f"""<div style="margin:6px 0 4px 0;">
+        <div style="display:flex;justify-content:space-between;font-size:0.72em;color:#888;margin-bottom:3px;">
+            <span>{label}</span><span style="font-weight:700;color:{color};">{status}</span>
+        </div>
+        <div style="background:#e8eaf0;border-radius:6px;height:7px;overflow:hidden;">
+            <div style="background:{color};width:{pct_display:.1f}%;height:100%;border-radius:6px;"></div>
+        </div>
+    </div>"""
+
+def _podium_html(top3, emoji_fn, inverse=False):
+    """Génère le HTML d'un podium visuel (marches) pour une liste de 1-3 items {poste, delta}."""
+    if not top3:
+        return ""
+    medals = ["🥇", "🥈", "🥉"]
+    bar_colors = [
+        "linear-gradient(160deg,#FFD700,#FFA500)",
+        "linear-gradient(160deg,#C8C8C8,#9e9e9e)",
+        "linear-gradient(160deg,#CD7F32,#8B5E2A)"
+    ]
+    bar_heights = [115, 80, 55]
+    font_sizes = [2.2, 1.85, 1.55]
+    # Ordre visuel : 2e | 1er | 3e
+    visual_slots = [1, 0, 2]
+
+    html = '<div style="display:flex;align-items:flex-end;justify-content:center;gap:8px;padding:12px 0 0 0;">'
+    for vi in visual_slots:
+        if vi >= len(top3):
+            # case vide pour maintenir l'alignement
+            html += '<div style="width:31%;min-width:80px;"></div>'
+            continue
+        item = top3[vi]
+        rank = vi
+        sign = "+" if item['delta'] > 0 else ""
+        delta_color = "#27ae60" if (item['delta'] < 0) == inverse else "#e74c3c"
+        label = emoji_fn(item['poste'])
+        html += f"""<div style="display:flex;flex-direction:column;align-items:center;width:31%;min-width:80px;">
+            <div style="font-weight:700;font-size:0.78em;text-align:center;margin:3px 0 1px;line-height:1.2;">{label}</div>
+            <div style="color:{delta_color};font-weight:800;font-size:0.88em;">{sign}{item['delta']:.1f}%</div>
+            <div style="background:{bar_colors[rank]};width:100%;height:{bar_heights[rank]}px;
+                        border-radius:8px 8px 0 0;margin-top:6px;
+                        box-shadow:0 4px 14px rgba(0,0,0,0.18);"></div>
+        </div>"""
+    html += '</div>'
+    return html
+
 # --- BARRE LATÉRALE (NAVIGATION) ---
 st.sidebar.title("Navigation")
 page = st.sidebar.radio(
@@ -259,29 +315,35 @@ if page == "Dashboard Global":
         th_delta = calculate_delta(th_val, prev_week['Total heure'] if prev_week is not None else None)
         col2.metric("Total Heures", f"{th_val:.1f} h", delta=f"{th_delta:.1f}%" if th_delta is not None else None, delta_color="inverse")
         
+        # Euro/Kilo Global — calculé en premier pour dériver la cible Kg/H cohérente
+        ek_val = latest_week['Euro_kilo_global'] if 'Euro_kilo_global' in latest_week and pd.notna(latest_week['Euro_kilo_global']) else 0
+        ek_delta = calculate_delta(ek_val, prev_week['Euro_kilo_global'] if prev_week is not None and 'Euro_kilo_global' in prev_week else None)
+
         # Productivité Globale (Kg/H)
         prod_val = latest_week['Global_kg_h'] if 'Global_kg_h' in latest_week and pd.notna(latest_week['Global_kg_h']) else 0
         prod_delta = calculate_delta(prod_val, prev_week['Global_kg_h'] if prev_week is not None and 'Global_kg_h' in prev_week else None)
         col3.metric("Productivité", f"{prod_val:.2f} kg/h", delta=f"{prod_delta:.1f}%" if prod_delta is not None else None)
-        if prod_val > 0:
-            pct_to_do_prod = ((OBJECTIFS_KGH_ETAPE1['Global'] - prod_val) / prod_val) * 100
-            if pct_to_do_prod > 0:
-                heures_a_supprimer_prod = th_val - (prod_val * th_val / OBJECTIFS_KGH_ETAPE1['Global'])
-                col3.caption(f"🎯 Reste pour Étape 1 : +{pct_to_do_prod:.1f}% (-{int(round(heures_a_supprimer_prod))} h)")
+        if prod_val > 0 and ek_val > 0:
+            # Cible Kg/H déduite : coût_horaire = ek × kgh  →  kgh_cible = coût_horaire / €/kg_cible
+            kgh_etape1_derive = ek_val * prod_val / OBJECTIF_EURO_KG_ETAPE1
+            pct_prod_atteint = min(prod_val / kgh_etape1_derive * 100, 100)  # = OBJECTIF_EURO_KG_ETAPE1/ek_val×100 → cohérent avec col4
+            if prod_val < kgh_etape1_derive:
+                heures_a_supprimer_prod = th_val * (1 - prod_val / kgh_etape1_derive)
+                suffix_prod = f" · -{int(round(heures_a_supprimer_prod))} h · cible {kgh_etape1_derive:.1f} kg/h"
             else:
-                col3.caption("🎯 Étape 1 atteinte ! 🎉")
+                suffix_prod = ""
+            col3.markdown(_progress_bar_html(pct_prod_atteint, label="🎯 Obj. Kg/H", suffix=suffix_prod), unsafe_allow_html=True)
 
-        # Euro/Kilo Global
-        ek_val = latest_week['Euro_kilo_global'] if 'Euro_kilo_global' in latest_week and pd.notna(latest_week['Euro_kilo_global']) else 0
-        ek_delta = calculate_delta(ek_val, prev_week['Euro_kilo_global'] if prev_week is not None and 'Euro_kilo_global' in prev_week else None)
+        # Euro/Kilo (affichage)
         col4.metric("Euro/Kilo", f"{ek_val:.2f} €/kg", delta=f"{ek_delta:.1f}%" if ek_delta is not None else None, delta_color="inverse")
         if ek_val > 0:
-            pct_to_do_ek = ((ek_val - OBJECTIF_EURO_KG_ETAPE1) / ek_val) * 100
-            if pct_to_do_ek > 0:
+            pct_ek_atteint = min(OBJECTIF_EURO_KG_ETAPE1 / ek_val * 100, 100)
+            if ek_val > OBJECTIF_EURO_KG_ETAPE1:
                 heures_a_supprimer_ek = th_val * (ek_val - OBJECTIF_EURO_KG_ETAPE1) / ek_val
-                col4.caption(f"🎯 Reste pour Étape 1 : -{pct_to_do_ek:.1f}% (-{int(round(heures_a_supprimer_ek))} h)")
+                suffix_ek = f" · -{int(round(heures_a_supprimer_ek))} h"
             else:
-                col4.caption("🎯 Étape 1 atteinte ! 🎉")
+                suffix_ek = ""
+            col4.markdown(_progress_bar_html(pct_ek_atteint, label="🎯 Obj. €/kg", suffix=suffix_ek), unsafe_allow_html=True)
 
         st.markdown("---")
         
@@ -326,7 +388,7 @@ if page == "Dashboard Global":
             go.Scatter(
                 x=[last_6_weeks['Semaine'].min(), last_6_weeks['Semaine'].max()],
                 y=[val_etape1_g, val_etape1_g],
-                name="Objectif Kg/H (Étape 1)",
+                name="Obj. Kg/H",
                 mode='lines',
                 line=dict(color='#ff7f0e', dash='dash', width=2)
             ),
@@ -430,7 +492,7 @@ if page == "Dashboard Global":
                 go.Scatter(
                     x=[last_6_weeks['Semaine'].min(), last_6_weeks['Semaine'].max()],
                     y=[OBJECTIF_EURO_KG_ETAPE1, OBJECTIF_EURO_KG_ETAPE1],
-                    name="Objectif €/Kg (Étape 1)",
+                    name="Obj. €/kg",
                     mode='lines',
                     line=dict(color='#2ca02c', dash='dash', width=2)
                 ),
@@ -470,7 +532,7 @@ if page == "Dashboard Global":
                 ref_week = ref_semaine_df.iloc[0] if not ref_semaine_df.empty else None
                 ref_lbl = "un mois (S-4)"
                 
-            postes = ['Chaud', 'Légumerie', 'Sushi', 'Découpe', 'Mix', 'Mélange', 'Désinfection', 'Traçabilité', 'CF tampon']
+            postes = ['Chaud', 'Légumerie', 'Découpe', 'Mix', 'Mélange']
             
             if ref_week is not None:
                 perfs_heures = []
@@ -497,21 +559,11 @@ if page == "Dashboard Global":
                 # Tri: progression Kg/H = delta le plus haut (positif)
                 top_kgh = sorted(perfs_kgh, key=lambda x: x["delta"], reverse=True)[:3]
                 
-                col_pod1, col_pod2 = st.columns(2)
-                
-                with col_pod1:
-                    st.markdown("#### 📉 Top 3 Baisses d'Heures")
-                    for i, perf in enumerate(top_heures):
-                        emoji_medaille = ["🥇", "🥈", "🥉"][i]
-                        sign = "+" if perf['delta'] > 0 else ""
-                        st.info(f"{emoji_medaille} **{POSTES_EMOJIS.get(perf['poste'], perf['poste'])}** : {sign}{perf['delta']:.1f}%")
-
-                with col_pod2:
-                    st.markdown("#### 🚀 Top 3 Progressions Productivity (Kg/H)")
-                    for i, perf in enumerate(top_kgh):
-                        emoji_medaille = ["🥇", "🥈", "🥉"][i]
-                        sign = "+" if perf['delta'] > 0 else ""
-                        st.success(f"{emoji_medaille} **{POSTES_EMOJIS.get(perf['poste'], perf['poste'])}** : {sign}{perf['delta']:.1f}%")
+                st.markdown("#### 📉 Top 3 Baisses d'Heures")
+                st.markdown(
+                    _podium_html(top_heures, lambda p: POSTES_EMOJIS.get(p, p), inverse=True),
+                    unsafe_allow_html=True
+                )
             else:
                 st.info(f"Données insuffisantes pour comparer à {ref_lbl}.")
                 
@@ -527,136 +579,205 @@ elif page in ["Chaud", "Légumerie", "Sushi", "Découpe", "Mix", "Mélange", "D�
         col_name = page # Pour 'Chaud', 'Légumerie', 'Sushi', 'Mix', 'Mélange'
         if page == "Découpe": col_name = "Découpe"
 
-        col1, col2 = st.columns([1, 2])
+        # --- CSS transparent pour navigation + slider ---
+        st.markdown("""
+        <style>
+        div[data-testid="stHorizontalBlock"] button {
+            background: transparent !important;
+            border: none !important;
+            box-shadow: none !important;
+            color: inherit !important;
+        }
+        div[data-testid="stHorizontalBlock"] button:hover {
+            background: rgba(128,128,128,0.1) !important;
+        }
+        div[data-testid="stSlider"] { opacity: 0.75; transition: opacity 0.2s; }
+        div[data-testid="stSlider"]:hover { opacity: 1; }
+        </style>
+        """, unsafe_allow_html=True)
 
-        with col1:
-            st.subheader("Derniers chiffres")
-            st.write(f"**Semaine actuelle (S{int(latest_week['Semaine'])}) :**")
-            
-            prev_week = last_6_weeks.iloc[-2] if len(last_6_weeks) > 1 else None
-            
-            # Heures consommées
-            val_h = latest_week[col_name] if col_name in latest_week else 0
-            delta_h = None
-            if prev_week is not None and col_name in prev_week:
-                prev_val_h = prev_week[col_name]
-                if prev_val_h > 0:
-                    delta_h = f"{((val_h - prev_val_h) / prev_val_h) * 100:.1f} %"
-            st.metric(label="Heures consommées", value=f"{val_h:.1f} h", delta=delta_h, delta_color="inverse")
-            
-            # Productivité (Kg/H)
-            kgh_col = f"{col_name}_kg_h"
-            if kgh_col in latest_week:
-                val_kgh = latest_week[kgh_col]
-                delta_kgh = None
-                if prev_week is not None and kgh_col in prev_week:
-                    prev_val_kgh = prev_week[kgh_col]
-                    if prev_val_kgh > 0:
-                        delta_kgh = f"{((val_kgh - prev_val_kgh) / prev_val_kgh) * 100:.1f} %"
-                st.metric(label="Productivité", value=f"{val_kgh:.1f} kg/h", delta=delta_kgh, delta_color="normal")
-                if val_kgh > 0:
-                    obj_kgh_etape1 = OBJECTIFS_KGH_ETAPE1.get(page)
-                    if obj_kgh_etape1:
-                        pct_to_do_poste = ((obj_kgh_etape1 - val_kgh) / val_kgh) * 100
-                        if pct_to_do_poste > 0:
-                            heures_a_supprimer_poste = val_h - (val_kgh * val_h / obj_kgh_etape1)
-                            st.caption(f"🎯 Reste pour Étape 1 : +{pct_to_do_poste:.1f}% (-{int(round(heures_a_supprimer_poste))} h)")
-                        else:
-                            st.caption("🎯 Étape 1 atteinte ! 🎉")
-            
-            st.write("**Historique (6 sem.) :**")
-            # N'afficher que les colonnes qui existent
-            display_cols = ['Semaine']
-            if col_name in last_6_weeks.columns:
-                display_cols.append(col_name)
-            if f"{col_name}_kg_h" in last_6_weeks.columns:
-                display_cols.append(f"{col_name}_kg_h")
-            st.dataframe(last_6_weeks[display_cols])
+        # --- NAVIGATION PAR SEMAINE (flèches) ---
+        semaines_dispos_poste = sorted(data['Semaine'].dropna().unique().astype(int).tolist())
+        n_weeks_total = len(semaines_dispos_poste)
+        week_key = f"week_idx_{page}"
+        if week_key not in st.session_state:
+            st.session_state[week_key] = n_weeks_total - 1  # Dernière semaine par défaut
 
-        with col2:
-            st.subheader(f"Comparaison Heures vs Kg/H - {page}")
-            
-            kgh_col = f"{col_name}_kg_h"
-            if col_name in last_6_weeks.columns:
-                fig_poste = make_subplots(specs=[[{"secondary_y": True}]])
-                
-                c_pastel = COULEURS_POSTES.get(page, '#1f77b4')
-                c_fonce = COULEURS_POSTES_FONCEES.get(page, '#ff7f0e')
-                COULEURS_TEXTES_FONCEES = {
-                    'Chaud': '#801509',
-                    'Légumerie': '#345209',
-                    'Sushi': '#133554',
-                    'Découpe': '#452345',
-                    'Mix': '#7a4608',
-                    'Mélange': '#524b07',
-                    'Désinfection': '#0f5c45',
-                    'Traçabilité': '#413e66',
-                    'CF tampon': '#1f4a6b'
-                }
-                c_texte_fonce = COULEURS_TEXTES_FONCEES.get(page, '#000000')
+        nav_c1, nav_c2, nav_c3, nav_c4, nav_c5 = st.columns([1, 1, 4, 1, 1])
+        with nav_c1:
+            if st.button("⏮", key=f"first_{page}", help="Première semaine"):
+                st.session_state[week_key] = 0
+        with nav_c2:
+            if st.button("◀", key=f"prev_{page}", help="Semaine précédente"):
+                st.session_state[week_key] = max(0, st.session_state[week_key] - 1)
+        with nav_c3:
+            sem_display = semaines_dispos_poste[st.session_state[week_key]]
+            idx_display = st.session_state[week_key]
+            st.markdown(
+                f"<p style='text-align:center;font-size:1.25rem;font-weight:700;margin:0.3rem 0'>"
+                f"📅 Semaine {sem_display} &nbsp;<span style='font-size:0.8rem;color:#888'>({idx_display + 1}/{n_weeks_total})</span></p>",
+                unsafe_allow_html=True
+            )
+        with nav_c4:
+            if st.button("▶", key=f"next_{page}", help="Semaine suivante"):
+                st.session_state[week_key] = min(n_weeks_total - 1, st.session_state[week_key] + 1)
+        with nav_c5:
+            if st.button("⏭", key=f"last_{page}", help="Dernière semaine"):
+                st.session_state[week_key] = n_weeks_total - 1
 
-                # Axe 1 : Heures (Barres)
+        selected_semaine_poste = semaines_dispos_poste[st.session_state[week_key]]
+
+        n_semaines = st.slider("Semaines à afficher :", min_value=4, max_value=12, value=6, step=2, key=f"nsem_{page}")
+
+        # Recalcul des données locales pour ce poste selon les filtres
+        latest_week = data[data['Semaine'] == selected_semaine_poste].iloc[0]
+        data_jusqu_a_poste = data[data['Semaine'] <= selected_semaine_poste]
+        last_6_weeks = data_jusqu_a_poste.tail(n_semaines)
+        prev_week = last_6_weeks.iloc[-2] if len(last_6_weeks) > 1 else None
+
+        # Pré-calcul val_h + delta_h
+        val_h = latest_week[col_name] if col_name in latest_week else 0
+        delta_h = None
+        if prev_week is not None and col_name in prev_week:
+            prev_val_h = prev_week[col_name]
+            if prev_val_h > 0:
+                delta_h = f"{((val_h - prev_val_h) / prev_val_h) * 100:.1f} %"
+
+        # Pré-calcul variables kg/h (pour le graphique uniquement)
+        kgh_col = f"{col_name}_kg_h"
+        val_kgh = None
+        prev_val_kgh = None
+        prev2_val_kgh = None
+        if kgh_col in latest_week:
+            val_kgh = latest_week[kgh_col]
+            prev_val_kgh = prev_week[kgh_col] if prev_week is not None and kgh_col in prev_week else None
+            prev2_week = last_6_weeks.iloc[-3] if len(last_6_weeks) >= 3 else None
+            prev2_val_kgh = prev2_week[kgh_col] if prev2_week is not None and kgh_col in prev2_week else None
+
+        # --- GRAPHIQUE PLEINE LARGEUR ---
+        if col_name in last_6_weeks.columns:
+            if page == "Sushi":
+                st.subheader(f"Kilos Sushi vs Kg/H - {page}")
+            else:
+                st.subheader(f"Comparaison Heures vs Kg/H - {page}")
+
+            fig_poste = make_subplots(specs=[[{"secondary_y": True}]])
+
+            c_pastel = COULEURS_POSTES.get(page, '#1f77b4')
+            c_fonce = COULEURS_POSTES_FONCEES.get(page, '#ff7f0e')
+            COULEURS_TEXTES_FONCEES = {
+                'Chaud': '#801509',
+                'Légumerie': '#345209',
+                'Sushi': '#133554',
+                'Découpe': '#452345',
+                'Mix': '#7a4608',
+                'Mélange': '#524b07',
+                'Désinfection': '#0f5c45',
+                'Traçabilité': '#413e66',
+                'CF tampon': '#1f4a6b'
+            }
+            c_texte_fonce = COULEURS_TEXTES_FONCEES.get(page, '#000000')
+
+            if page == "Sushi" and 'Kg Sushi' in last_6_weeks.columns:
                 fig_poste.add_trace(
                     go.Bar(
-                        x=last_6_weeks['Semaine'], 
-                        y=last_6_weeks[col_name], 
-                        name="Heures", 
+                        x=last_6_weeks['Semaine'],
+                        y=last_6_weeks['Kg Sushi'],
+                        name="Kilos Sushi",
+                        marker_color=c_pastel,
+                        text=last_6_weeks['Kg Sushi'].fillna(0).round(1).astype(str) + " <i>kg</i>",
+                        textposition='inside',
+                        insidetextanchor='middle',
+                        textfont=dict(weight='bold', color='black')
+                    ),
+                    secondary_y=False,
+                )
+            else:
+                fig_poste.add_trace(
+                    go.Bar(
+                        x=last_6_weeks['Semaine'],
+                        y=last_6_weeks[col_name],
+                        name="Heures",
                         marker_color=c_pastel,
                         text=last_6_weeks[col_name].fillna(0).round(0).astype(int).astype(str) + " <i>h</i>",
                         textposition='inside',
                         insidetextanchor='middle',
-                        textfont=dict(weight='bold', color='black') # Noir pour bien contraster
+                        textfont=dict(weight='bold', color='black')
                     ),
                     secondary_y=False,
                 )
-                
-                # Axe 2 : Kg/H (Ligne)
-                if kgh_col in last_6_weeks.columns:
+
+            if kgh_col in last_6_weeks.columns:
+                fig_poste.add_trace(
+                    go.Scatter(
+                        x=last_6_weeks['Semaine'],
+                        y=last_6_weeks[kgh_col],
+                        name="Kg/H",
+                        line=dict(color=c_fonce, width=3),
+                        mode='lines+markers+text',
+                        text=last_6_weeks[kgh_col].round(1).astype(str) + " <i>kg/h</i>",
+                        textposition='top center',
+                        textfont=dict(weight='bold', size=13, color=c_texte_fonce)
+                    ),
+                    secondary_y=True,
+                )
+
+                obj_kgh = OBJECTIFS_KGH_ETAPE1.get(page)
+                if obj_kgh:
                     fig_poste.add_trace(
                         go.Scatter(
-                            x=last_6_weeks['Semaine'], 
-                            y=last_6_weeks[kgh_col], 
-                            name="Kg/H", 
-                            line=dict(color=c_fonce, width=3),
-                            mode='lines+markers+text',
-                            text=last_6_weeks[kgh_col].round(1).astype(str) + " <i>kg/h</i>",
-                            textposition='top center',
-                            textfont=dict(weight='bold', size=13, color=c_texte_fonce)
+                            x=[last_6_weeks['Semaine'].min(), last_6_weeks['Semaine'].max()],
+                            y=[obj_kgh, obj_kgh],
+                            name="Obj. Kg/H",
+                            mode='lines',
+                            line=dict(color=c_fonce, dash='dash', width=2)
                         ),
                         secondary_y=True,
                     )
-                    
-                    obj_kgh = OBJECTIFS_KGH_ETAPE1.get(page)
-                    if obj_kgh:
-                        fig_poste.add_trace(
-                            go.Scatter(
-                                x=[last_6_weeks['Semaine'].min(), last_6_weeks['Semaine'].max()],
-                                y=[obj_kgh, obj_kgh],
-                                name="Objectif Kg/H (Étape 1)",
-                                mode='lines',
-                                line=dict(color=c_fonce, dash='dash', width=2)
-                            ),
-                            secondary_y=True,
-                        )
-                
-                fig_poste.update_layout(
-                    xaxis_title="Semaine",
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-                )
-                # Forcer le départ à 0 pour éviter l'effet yoyo. Limiter à 160 les heures de Mix/Mélange.
-                if page in ["Mix", "Mélange"]:
-                    fig_poste.update_yaxes(title_text="Heures", secondary_y=False, range=[0, 160])
-                else:
-                    fig_poste.update_yaxes(title_text="Heures", secondary_y=False, rangemode="tozero")
-                
-                obj_kgh_poste = OBJECTIFS_KGH_ETAPE1.get(page, 0)
-                max_kgh = last_6_weeks[kgh_col].max() if kgh_col in last_6_weeks.columns else 0
-                max_y2_poste = max(max_kgh * 1.2, obj_kgh_poste * 1.2, 10)
-                fig_poste.update_yaxes(title_text="Kg/H", secondary_y=True, range=[0, max_y2_poste])
-                
-                st.plotly_chart(fig_poste, use_container_width=True)
+
+            fig_poste.update_layout(
+                xaxis_title="Semaine",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+            )
+            if page == "Sushi" and 'Kg Sushi' in last_6_weeks.columns:
+                fig_poste.update_yaxes(title_text="Kilos", secondary_y=False, rangemode="tozero")
+            elif page in ["Mix", "Mélange"]:
+                fig_poste.update_yaxes(title_text="Heures", secondary_y=False, range=[0, 160])
             else:
-                st.warning(f"La colonne '{col_name}' est introuvable.")
+                fig_poste.update_yaxes(title_text="Heures", secondary_y=False, rangemode="tozero")
+
+            obj_kgh_poste = OBJECTIFS_KGH_ETAPE1.get(page, 0)
+            max_kgh = last_6_weeks[kgh_col].max() if kgh_col in last_6_weeks.columns else 0
+            if page == "Sushi":
+                max_y2_poste = max(max_kgh * 1.3, obj_kgh_poste * 1.5, 5)
+            else:
+                max_y2_poste = max(max_kgh * 1.2, obj_kgh_poste * 1.2, 10)
+            fig_poste.update_yaxes(title_text="Kg/H", secondary_y=True, range=[0, max_y2_poste])
+
+            st.plotly_chart(fig_poste, use_container_width=True)
+        else:
+            st.warning(f"La colonne '{col_name}' est introuvable.")
+
+        # --- MÉTRIQUES + HISTORIQUE ---
+        st.subheader("Derniers chiffres")
+        st.metric(label="Heures consommées", value=f"{val_h:.1f} h", delta=delta_h, delta_color="inverse")
+
+        if page == "Sushi" and 'Kg Sushi' in latest_week.index:
+            kg_sushi_val = latest_week['Kg Sushi'] if pd.notna(latest_week['Kg Sushi']) else 0
+            delta_kg_sushi = None
+            if prev_week is not None and 'Kg Sushi' in prev_week and prev_week['Kg Sushi'] > 0:
+                delta_kg_sushi = f"{((kg_sushi_val - prev_week['Kg Sushi']) / prev_week['Kg Sushi']) * 100:.1f} %"
+            st.metric(label="Kilos Sushi", value=f"{kg_sushi_val:.1f} kg", delta=delta_kg_sushi)
+
+        st.write("**Historique (6 sem.) :**")
+        display_cols = ['Semaine']
+        if col_name in last_6_weeks.columns:
+            display_cols.append(col_name)
+        if page == "Sushi" and 'Kg Sushi' in last_6_weeks.columns:
+            display_cols.append('Kg Sushi')
+        if f"{col_name}_kg_h" in last_6_weeks.columns:
+            display_cols.append(f"{col_name}_kg_h")
+        st.dataframe(last_6_weeks[display_cols])
     else:
         st.info("Aucune donnée disponible.")
 
@@ -673,7 +794,7 @@ elif page == "Saisie de données":
         with col_s:
             new_semaine = st.number_input("Numéro de la semaine", min_value=1, max_value=53, value=default_semaine)
         with col_k:
-            new_kilos = st.number_input("Kilos produits (total)", min_value=0.0, step=10.0)
+            new_kilos = st.number_input("Total Kilos Produits (incluant Sushi)", min_value=0.0, step=10.0)
         with col_t:
             new_taux = st.number_input("Taux horaire (€/h)", min_value=0.0, step=0.5, value=25.0)
             
@@ -684,7 +805,11 @@ elif page == "Saisie de données":
             new_leg = st.number_input(f"{POSTES_EMOJIS['Légumerie']} Heures", min_value=0.0, step=0.5)
             new_desinfection = st.number_input(f"{POSTES_EMOJIS['Désinfection']} Heures", min_value=0.0, step=0.5)
         with col2:
-            new_sushi = st.number_input(f"{POSTES_EMOJIS['Sushi']} Heures", min_value=0.0, step=0.5)
+            col_s_h, col_s_k = st.columns(2)
+            with col_s_h:
+                new_sushi = st.number_input(f"{POSTES_EMOJIS['Sushi']} Heures", min_value=0.0, step=0.5)
+            with col_s_k:
+                new_sushi_kg = st.number_input(f"{POSTES_EMOJIS['Sushi']} Kilos", min_value=0.0, step=0.5)
             new_decoupe = st.number_input(f"{POSTES_EMOJIS['Découpe']} Heures", min_value=0.0, step=0.5)
             new_tracabilite = st.number_input(f"{POSTES_EMOJIS['Traçabilité']} Heures", min_value=0.0, step=0.5)
         with col3:
@@ -698,7 +823,9 @@ elif page == "Saisie de données":
         
         submitted = st.form_submit_button("Enregistrer la semaine")
         if submitted:
-            # Utiliser les noms de colonnes originaux Firestore
+            # Calculs de la productivité
+            kilos_hors_sushi = new_kilos - new_sushi_kg
+            
             doc_data = {
                 'Semaine': int(new_semaine),
                 'Total heure': float(total_heure),
@@ -714,22 +841,23 @@ elif page == "Saisie de données":
                 
                 # Nouveaux champs saisis & stockés
                 'Kg produits global': float(new_kilos),
+                'Kg Sushi': float(new_sushi_kg),
                 'Taux horaire': float(new_taux),
                 
                 # Productivité globale
                 'Kg/H ': float(new_kilos / total_heure) if total_heure > 0 else 0.0,
                 '€/kg (Mep global)': float((total_heure * new_taux) / new_kilos) if new_kilos > 0 else 0.0,
                 
-                # Productivité par poste
-                'Chaud kg/H': float(new_kilos / new_chaud) if new_chaud > 0 else 0.0,
-                'Légumerie KG/H': float(new_kilos / new_leg) if new_leg > 0 else 0.0,
-                'Découpe KG/H': float(new_kilos / new_decoupe) if new_decoupe > 0 else 0.0,
-                'Kg/H Sushi': float(new_kilos / new_sushi) if new_sushi > 0 else 0.0,
-                'Mix KG/H': float(new_kilos / new_mix) if new_mix > 0 else 0.0,
-                'Mélange KG/H': float(new_kilos / new_melange) if new_melange > 0 else 0.0,
-                'Désinfection KG/H': float(new_kilos / new_desinfection) if new_desinfection > 0 else 0.0,
-                'Traçabilité KG/H': float(new_kilos / new_tracabilite) if new_tracabilite > 0 else 0.0,
-                'CF tampon KG/H': float(new_kilos / new_cf_tampon) if new_cf_tampon > 0 else 0.0,
+                # Productivité par poste (déduction faite des kilos sushi pour les autres postes)
+                'Chaud kg/H': float(kilos_hors_sushi / new_chaud) if new_chaud > 0 else 0.0,
+                'Légumerie KG/H': float(kilos_hors_sushi / new_leg) if new_leg > 0 else 0.0,
+                'Découpe KG/H': float(kilos_hors_sushi / new_decoupe) if new_decoupe > 0 else 0.0,
+                'Kg/H Sushi': float(new_sushi_kg / new_sushi) if new_sushi > 0 else 0.0,
+                'Mix KG/H': float(kilos_hors_sushi / new_mix) if new_mix > 0 else 0.0,
+                'Mélange KG/H': float(kilos_hors_sushi / new_melange) if new_melange > 0 else 0.0,
+                'Désinfection KG/H': float(kilos_hors_sushi / new_desinfection) if new_desinfection > 0 else 0.0,
+                'Traçabilité KG/H': float(kilos_hors_sushi / new_tracabilite) if new_tracabilite > 0 else 0.0,
+                'CF tampon KG/H': float(kilos_hors_sushi / new_cf_tampon) if new_cf_tampon > 0 else 0.0,
                 
                 # Ancien champ conservé à 0 pour la compatibilité
                 'Commandes': 0,
