@@ -64,6 +64,23 @@ def _get_firestore_client():
 
 _db = _get_firestore_client()
 
+def _get_gcp_credentials():
+    """Retourne les credentials GCP (scoped) pour Vision API et autres services."""
+    scopes = ["https://www.googleapis.com/auth/cloud-platform"]
+    try:
+        if "FIREBASE_CREDENTIALS" in st.secrets:
+            key_dict = json.loads(base64.b64decode(st.secrets["FIREBASE_CREDENTIALS"]).decode("utf-8"))
+            return service_account.Credentials.from_service_account_info(key_dict, scopes=scopes)
+        if "gcp_service_account" in st.secrets:
+            key_dict = json.loads(json.dumps(dict(st.secrets["gcp_service_account"])))
+            return service_account.Credentials.from_service_account_info(key_dict, scopes=scopes)
+    except Exception:
+        pass
+    key_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "firebase-key.json")
+    if os.path.exists(key_path):
+        return service_account.Credentials.from_service_account_file(key_path, scopes=scopes)
+    return None
+
 # Configuration globale de la police Plotly
 pio.templates.default = "plotly"
 pio.templates[pio.templates.default].layout.font.family = "Montserrat, sans-serif"
@@ -181,22 +198,33 @@ def load_factures():
                   key=lambda x: x.get("date", ""), reverse=True)
 
 def _calcul_fiche(recette, prix_dict):
-    """Calcule les coûts d'une recette selon le catalogue de prix."""
+    """Calcule les coûts d'une recette.
+    Règle : coût = poids_brut × prix/kg  (on achète le brut, la perte est supportée)
+    net = brut × (1 - taux_perte/100)
+    """
     rows = []
     total_cout = 0.0
     for ing in recette.get("ingredients", []):
         brut = float(ing.get("poids_brut_kg", 0))
-        net  = float(ing.get("poids_net_kg", 0))
-        perte_pct = round((brut - net) / brut * 100, 1) if brut > 0 else 0
-        prix = prix_dict.get(ing["nom"], {}).get("prix_unitaire", ing.get("prix_unitaire", 0))
-        cout = round(net * float(prix), 2)
+        # Taux de perte : priorité à taux_perte_pct, sinon calculé depuis poids_net_kg
+        if "taux_perte_pct" in ing:
+            perte_pct = float(ing["taux_perte_pct"])
+            net = round(brut * (1 - perte_pct / 100), 4)
+        elif "poids_net_kg" in ing and brut > 0:
+            net = float(ing["poids_net_kg"])
+            perte_pct = round((brut - net) / brut * 100, 1)
+        else:
+            net = brut
+            perte_pct = 0.0
+        prix = float(prix_dict.get(ing["nom"], {}).get("prix_unitaire", ing.get("prix_unitaire", 0)))
+        cout = round(brut * prix, 2)   # on paye le poids brut
         total_cout += cout
         rows.append({
             "Ingrédient": ing["nom"],
-            "Brut (kg)": brut,
-            "Net (kg)": net,
-            "Perte %": f"{perte_pct}%",
-            "Prix/kg (€)": round(float(prix), 2),
+            "Brut (kg)": round(brut, 3),
+            "Perte %": f"{round(perte_pct, 1)}%",
+            "Net final (kg)": round(net, 3),
+            "Prix/kg brut (€)": round(prix, 2),
             "Coût (€)": cout,
         })
     nb = recette.get("nb_couverts", 1) or 1
@@ -306,49 +334,104 @@ def seed_recettes_fictives():
             "nom": nom, "prix_unitaire": prix, "unite": "kg",
             "fournisseur": "", "updated_at": today
         })
-    # Seed recettes
+    # Seed recettes — convertit poids_net_kg → taux_perte_pct
     for rec in recettes:
+        for ing in rec["ingredients"]:
+            brut = float(ing.get("poids_brut_kg", 0))
+            net  = float(ing.pop("poids_net_kg", brut))
+            ing["taux_perte_pct"] = round((brut - net) / brut * 100, 1) if brut > 0 else 0.0
         rec_id = str(uuid.uuid4())
         _db.collection(COLLECTION_RECETTES).document(rec_id).set({**rec, "created_at": today})
     st.cache_data.clear()
 
-def _extract_facture_claude(image_bytes: bytes, media_type: str = "image/jpeg") -> dict:
-    """Envoie une image de facture à Claude Opus et retourne les données extraites."""
+def _parse_facture_text(text: str) -> dict:
+    """Parse heuristique du texte OCR d'une facture vers un dict structuré."""
+    import re
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+
+    # Fournisseur = première ligne non vide significative
+    fournisseur = lines[0] if lines else ""
+
+    # Date : cherche patterns DD/MM/YYYY, DD-MM-YYYY, YYYY-MM-DD
+    date_val = ""
+    for pat, fmt in [
+        (r'\b(\d{2})[/-](\d{2})[/-](\d{4})\b', lambda m: f"{m.group(3)}-{m.group(2)}-{m.group(1)}"),
+        (r'\b(\d{4})-(\d{2})-(\d{2})\b',        lambda m: m.group(0)),
+    ]:
+        m = re.search(pat, text)
+        if m:
+            date_val = fmt(m)
+            break
+
+    # Numéro facture
+    numero = ""
+    for pat in [r'(?:N°|No|Facture|FAC|INV)[^\d]*(\w[\w\-/]+)', r'\b(FAC|INV|F)[-\s]?(\d{3,})\b']:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            numero = m.group(0)
+            break
+
+    # Lignes : cherche pattern "texte ... quantité ... prix"
+    lignes = []
+    line_pat = re.compile(
+        r'^(.{3,40}?)\s+(\d+[,.]?\d*)\s*(?:kg|pce|l|un|x)?\s+(\d+[,.]?\d+)\s+(\d+[,.]?\d+)',
+        re.IGNORECASE
+    )
+    for l in lines:
+        m = line_pat.match(l)
+        if m:
+            try:
+                lignes.append({
+                    "article": m.group(1).strip(),
+                    "quantite": float(m.group(2).replace(",", ".")),
+                    "unite": "kg",
+                    "prix_unitaire": float(m.group(3).replace(",", ".")),
+                    "total_ht": float(m.group(4).replace(",", ".")),
+                })
+            except ValueError:
+                pass
+
+    # Totaux : cherche montants après mots-clés
+    def find_amount(keywords):
+        for kw in keywords:
+            m = re.search(rf'{kw}[^\d]*(\d+[,. ]\d{{2}})', text, re.IGNORECASE)
+            if m:
+                return float(m.group(1).replace(" ", "").replace(",", "."))
+        return 0.0
+
+    total_ht  = find_amount(["total ht", "montant ht", "ht"])
+    tva       = find_amount(["tva", "t\\.v\\.a", "taxe"])
+    total_ttc = find_amount(["total ttc", "montant ttc", "ttc", "total"])
+
+    return {
+        "fournisseur": fournisseur,
+        "date": date_val or str(date.today()),
+        "numero": numero,
+        "lignes": lignes,
+        "total_ht": total_ht,
+        "tva": tva,
+        "total_ttc": total_ttc,
+        "_texte_brut": text,  # conservé pour vérification manuelle
+    }
+
+
+def _extract_facture_vision(image_bytes: bytes, media_type: str = "image/jpeg") -> dict:
+    """Utilise Google Cloud Vision (gratuit 1000 req/mois) pour extraire le texte d'une facture."""
     try:
-        import anthropic
-        api_key = st.secrets.get("ANTHROPIC_API_KEY", os.environ.get("ANTHROPIC_API_KEY", ""))
-        if not api_key:
-            return {"error": "Clé ANTHROPIC_API_KEY manquante dans st.secrets"}
-        client = anthropic.Anthropic(api_key=api_key)
-        img_b64 = base64.b64encode(image_bytes).decode("utf-8")
-        prompt = """Analyse cette facture et retourne UNIQUEMENT un JSON valide avec cette structure exacte :
-{
-  "fournisseur": "nom du fournisseur",
-  "date": "YYYY-MM-DD",
-  "numero": "numéro de facture",
-  "lignes": [
-    {"article": "nom article", "quantite": 0.0, "unite": "kg", "prix_unitaire": 0.0, "total_ht": 0.0}
-  ],
-  "total_ht": 0.0,
-  "tva": 0.0,
-  "total_ttc": 0.0
-}
-Si une valeur est introuvable, utilise "" pour les strings et 0.0 pour les nombres. Retourne uniquement le JSON, sans texte autour."""
-        response = client.messages.create(
-            model="claude-opus-4-6",
-            max_tokens=2000,
-            messages=[{"role": "user", "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": img_b64}},
-                {"type": "text", "text": prompt}
-            ]}]
-        )
-        raw = response.content[0].text.strip()
-        # Nettoyer les balises markdown si présentes
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        return json.loads(raw.strip())
+        from google.cloud import vision as gvision
+        creds = _get_gcp_credentials()
+        if creds is None:
+            return {"error": "Credentials GCP non trouvés."}
+        vision_client = gvision.ImageAnnotatorClient(credentials=creds)
+        image = gvision.Image(content=image_bytes)
+        response = vision_client.document_text_detection(image=image)
+        if response.error.message:
+            return {"error": response.error.message}
+        full_text = response.full_text_annotation.text if response.full_text_annotation else ""
+        if not full_text:
+            return {"error": "Aucun texte détecté dans l'image."}
+        result = _parse_facture_text(full_text)
+        return result
     except Exception as e:
         return {"error": str(e)}
 
@@ -1102,61 +1185,221 @@ elif page == "Fiches Techniques":
     recettes_list = load_recettes()
     prix_dict     = load_ingredients()
 
-    if not recettes_list:
-        st.info("Aucune recette trouvée. Ajoutez-en une ci-dessous.")
-    else:
-        # ── Sélecteur recette ──────────────────────────────
-        noms = [r["nom"] for r in recettes_list]
-        col_sel, col_btn = st.columns([4, 1])
-        with col_sel:
-            nom_choisi = st.selectbox("Sélectionner une recette :", noms)
-        recette = next((r for r in recettes_list if r["nom"] == nom_choisi), None)
+    tab_fiche, tab_prod, tab_ajout = st.tabs(["📋 Fiche Recette", "🏭 Plan de Production", "➕ Ajouter une recette"])
 
-        if recette:
-            rows, cout_total, cout_couvert = _calcul_fiche(recette, prix_dict)
+    # ══════════════════════════════════════════════════════
+    # ONGLET 1 : FICHE RECETTE
+    # ══════════════════════════════════════════════════════
+    with tab_fiche:
+        if not recettes_list:
+            st.info("Aucune recette trouvée. Utilisez l'onglet 'Ajouter une recette'.")
+        else:
+            noms = [r["nom"] for r in recettes_list]
+            nom_choisi = st.selectbox("Sélectionner une recette :", noms, key="sel_fiche")
+            recette = next((r for r in recettes_list if r["nom"] == nom_choisi), None)
 
-            # ── KPIs ──────────────────────────────────────
-            k1, k2, k3, k4 = st.columns(4)
-            k1.metric("Catégorie", recette.get("categorie", "—"))
-            k2.metric("Couverts", recette.get("nb_couverts", "—"))
-            k3.metric("Coût matière total", f"{cout_total:.2f} €")
-            k4.metric("Coût / couvert", f"{cout_couvert:.2f} €")
+            if recette:
+                rows, cout_total, cout_couvert = _calcul_fiche(recette, prix_dict)
 
-            st.divider()
+                # ── KPIs ──────────────────────────────────
+                k1, k2, k3, k4 = st.columns(4)
+                k1.metric("Catégorie", recette.get("categorie", "—"))
+                k2.metric("Couverts", recette.get("nb_couverts", "—"))
+                k3.metric("Coût matière total", f"{cout_total:.2f} €")
+                k4.metric("Coût / couvert", f"{cout_couvert:.2f} €")
 
-            # ── Tableau ingrédients ───────────────────────
-            st.subheader("Composition")
-            df_ing = pd.DataFrame(rows)
-            # Barre de progression visuelle pour la perte
-            st.dataframe(
-                df_ing,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Brut (kg)":   st.column_config.NumberColumn(format="%.3f kg"),
-                    "Net (kg)":    st.column_config.NumberColumn(format="%.3f kg"),
-                    "Prix/kg (€)": st.column_config.NumberColumn(format="%.2f €"),
-                    "Coût (€)":    st.column_config.NumberColumn(format="%.2f €"),
-                }
+                st.divider()
+
+                # ── Tableau ingrédients ───────────────────
+                st.subheader("Composition")
+                df_ing = pd.DataFrame(rows)
+                st.dataframe(
+                    df_ing, use_container_width=True, hide_index=True,
+                    column_config={
+                        "Brut (kg)":          st.column_config.NumberColumn(format="%.3f kg"),
+                        "Net final (kg)":     st.column_config.NumberColumn(format="%.3f kg"),
+                        "Prix/kg brut (€)":   st.column_config.NumberColumn(format="%.2f €"),
+                        "Coût (€)":           st.column_config.NumberColumn(format="%.2f €"),
+                    }
+                )
+
+                # ── Répartition coûts ─────────────────────
+                if rows:
+                    fig_pie = px.pie(
+                        df_ing, values="Coût (€)", names="Ingrédient",
+                        title="Répartition du coût matière",
+                        hole=0.4,
+                        color_discrete_sequence=px.colors.qualitative.Pastel
+                    )
+                    fig_pie.update_layout(height=300, margin=dict(t=40, b=0))
+                    _, col_pie, _ = st.columns([1, 2, 1])
+                    with col_pie:
+                        st.plotly_chart(fig_pie, use_container_width=True)
+
+                st.divider()
+
+                # ── Prix de vente + Marge dynamique ───────
+                st.subheader("💰 Prix de vente & Marge")
+
+                # Recommandations automatiques
+                rec_eco     = cout_couvert / 0.35 if cout_couvert > 0 else 0
+                rec_std     = cout_couvert / 0.28 if cout_couvert > 0 else 0
+                rec_premium = cout_couvert / 0.20 if cout_couvert > 0 else 0
+
+                rco1, rco2, rco3 = st.columns(3)
+                rco1.metric("Éco (35% food cost)",     f"{rec_eco:.2f} €",     help="Prix minimum recommandé")
+                rco2.metric("Standard (28% food cost)", f"{rec_std:.2f} €",    delta="Recommandé", help="Objectif standard restauration")
+                rco3.metric("Premium (20% food cost)",  f"{rec_premium:.2f} €", help="Positionnement haut de gamme")
+
+                # Saisie du prix de vente
+                prix_vente_saved = float(recette.get("prix_vente_couvert", rec_std))
+                prix_vente = st.number_input(
+                    "Prix de vente (€ / couvert) :",
+                    min_value=0.0, value=prix_vente_saved,
+                    step=0.5, format="%.2f",
+                    key="prix_vente_input"
+                )
+
+                if prix_vente > 0:
+                    marge_brute  = prix_vente - cout_couvert
+                    marge_pct    = (marge_brute / prix_vente) * 100
+                    food_cost_pct = (cout_couvert / prix_vente) * 100
+
+                    # Couleur food cost
+                    if food_cost_pct < 28:
+                        fc_color, fc_icon = "#27ae60", "🟢"
+                    elif food_cost_pct < 35:
+                        fc_color, fc_icon = "#f39c12", "🟡"
+                    else:
+                        fc_color, fc_icon = "#e74c3c", "🔴"
+
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("Coût matière", f"{cout_couvert:.2f} €", f"{food_cost_pct:.1f}% du PV")
+                    m2.metric("Marge brute", f"{marge_brute:.2f} €",  f"{marge_pct:.1f}%")
+                    m3.metric("Food cost", f"{food_cost_pct:.1f}%", delta=f"Objectif < 30%",
+                              delta_color="inverse" if food_cost_pct > 30 else "normal")
+
+                    st.markdown(
+                        f"<div style='background:rgba(0,0,0,0.04);border-radius:8px;padding:10px 16px;margin:6px 0'>"
+                        f"{fc_icon} <b>Food cost :</b> <span style='color:{fc_color};font-weight:800'>{food_cost_pct:.1f}%</span>"
+                        f" &nbsp;|&nbsp; <b>Marge :</b> {marge_pct:.1f}%"
+                        f" &nbsp;|&nbsp; <b>Marge / couverts ({recette.get('nb_couverts',1)}) :</b> {marge_brute * recette.get('nb_couverts',1):.2f} €"
+                        f"</div>",
+                        unsafe_allow_html=True
+                    )
+
+                if st.button("💾 Sauvegarder le prix de vente", key="save_pv"):
+                    _db.collection(COLLECTION_RECETTES).document(recette["id"]).set(
+                        {"prix_vente_couvert": prix_vente}, merge=True
+                    )
+                    st.cache_data.clear()
+                    st.success("Prix de vente sauvegardé !")
+                    st.rerun()
+
+    # ══════════════════════════════════════════════════════
+    # ONGLET 2 : PLAN DE PRODUCTION
+    # ══════════════════════════════════════════════════════
+    with tab_prod:
+        st.subheader("🏭 Plan de Production")
+        if not recettes_list:
+            st.info("Ajoutez d'abord des recettes.")
+        else:
+            noms_prod = [r["nom"] for r in recettes_list]
+            recettes_choisies = st.multiselect(
+                "Sélectionner les recettes à produire :",
+                noms_prod, default=noms_prod[:2] if len(noms_prod) >= 2 else noms_prod,
+                key="prod_sel"
             )
 
-            # ── Répartition coûts (camembert) ────────────
-            if rows:
-                fig_pie = px.pie(
-                    df_ing, values="Coût (€)", names="Ingrédient",
-                    title="Répartition du coût matière",
-                    hole=0.4,
-                    color_discrete_sequence=px.colors.qualitative.Pastel
-                )
-                fig_pie.update_layout(height=320, margin=dict(t=40, b=0))
-                _, col_pie, _ = st.columns([1, 2, 1])
-                with col_pie:
-                    st.plotly_chart(fig_pie, use_container_width=True)
+            if recettes_choisies:
+                st.markdown("**Quantités à produire (nb de couverts) :**")
+                qtys = {}
+                cols_q = st.columns(min(len(recettes_choisies), 4))
+                for i, nom_r in enumerate(recettes_choisies):
+                    rec_r = next((r for r in recettes_list if r["nom"] == nom_r), None)
+                    nb_base = rec_r.get("nb_couverts", 1) if rec_r else 1
+                    with cols_q[i % 4]:
+                        qtys[nom_r] = st.number_input(
+                            nom_r, min_value=1, value=nb_base, step=1, key=f"qty_{nom_r}"
+                        )
 
-    st.divider()
+                st.divider()
 
-    # ── Formulaire ajout / édition recette ────────────────
-    with st.expander("➕ Ajouter / Modifier une recette", expanded=False):
+                # Calcul plan
+                plan_rows = []
+                ingredients_consolides = {}
+                cout_total_prod = 0.0
+
+                for nom_r in recettes_choisies:
+                    rec_r = next((r for r in recettes_list if r["nom"] == nom_r), None)
+                    if not rec_r:
+                        continue
+                    nb_base = rec_r.get("nb_couverts", 1) or 1
+                    nb_prod = qtys[nom_r]
+                    facteur = nb_prod / nb_base
+                    _, cout_rec, cout_cov = _calcul_fiche(rec_r, prix_dict)
+                    cout_total_r = round(cout_cov * nb_prod, 2)
+                    cout_total_prod += cout_total_r
+
+                    pv = float(rec_r.get("prix_vente_couvert", 0))
+                    ca_r = round(pv * nb_prod, 2) if pv > 0 else 0.0
+                    marge_r = round(ca_r - cout_total_r, 2) if pv > 0 else 0.0
+
+                    plan_rows.append({
+                        "Recette": nom_r,
+                        "Couverts": nb_prod,
+                        "Coût/couvert (€)": round(cout_cov, 2),
+                        "Coût total (€)": cout_total_r,
+                        "CA prévu (€)": ca_r if pv > 0 else "—",
+                        "Marge (€)": marge_r if pv > 0 else "—",
+                    })
+
+                    # Consolidation ingrédients
+                    for ing in rec_r.get("ingredients", []):
+                        nom_i = ing["nom"]
+                        brut_i = float(ing.get("poids_brut_kg", 0)) * facteur
+                        prix_i = float(prix_dict.get(nom_i, {}).get("prix_unitaire", ing.get("prix_unitaire", 0)))
+                        cout_i = round(brut_i * prix_i, 2)
+                        if nom_i in ingredients_consolides:
+                            ingredients_consolides[nom_i]["Quantité brute (kg)"] += brut_i
+                            ingredients_consolides[nom_i]["Coût (€)"] += cout_i
+                        else:
+                            ingredients_consolides[nom_i] = {
+                                "Ingrédient": nom_i,
+                                "Quantité brute (kg)": brut_i,
+                                "Prix/kg (€)": prix_i,
+                                "Coût (€)": cout_i,
+                            }
+
+                # Tableau récapitulatif
+                st.markdown("#### Récapitulatif par recette")
+                df_plan = pd.DataFrame(plan_rows)
+                st.dataframe(df_plan, use_container_width=True, hide_index=True)
+
+                # KPIs production
+                ca_total = sum(r.get("CA prévu (€)", 0) for r in plan_rows if isinstance(r.get("CA prévu (€)"), float))
+                marge_total = sum(r.get("Marge (€)", 0) for r in plan_rows if isinstance(r.get("Marge (€)"), float))
+                pk1, pk2, pk3 = st.columns(3)
+                pk1.metric("Coût total production", f"{cout_total_prod:.2f} €")
+                if ca_total > 0:
+                    pk2.metric("CA total prévu", f"{ca_total:.2f} €")
+                    pk3.metric("Marge totale prévue", f"{marge_total:.2f} €")
+
+                st.divider()
+
+                # Besoins ingrédients consolidés
+                st.markdown("#### Besoins en ingrédients (total)")
+                df_ing_cons = pd.DataFrame(list(ingredients_consolides.values()))
+                df_ing_cons["Quantité brute (kg)"] = df_ing_cons["Quantité brute (kg)"].round(3)
+                df_ing_cons["Coût (€)"] = df_ing_cons["Coût (€)"].round(2)
+                df_ing_cons = df_ing_cons.sort_values("Coût (€)", ascending=False)
+                st.dataframe(df_ing_cons, use_container_width=True, hide_index=True)
+
+    # ══════════════════════════════════════════════════════
+    # ONGLET 3 : AJOUTER UNE RECETTE
+    # ══════════════════════════════════════════════════════
+    with tab_ajout:
+        st.subheader("Ajouter une nouvelle recette")
         with st.form("form_recette"):
             c1, c2, c3 = st.columns(3)
             with c1:
@@ -1166,18 +1409,33 @@ elif page == "Fiches Techniques":
             with c3:
                 f_couverts = st.number_input("Nombre de couverts", min_value=1, value=6, step=1)
 
-            st.markdown("**Ingrédients** (ajoutez jusqu'à 10)")
+            st.markdown("**Ingrédients** — saisir le poids **brut** acheté + taux de perte")
+            st.caption("Coût = poids brut × prix/kg  |  Net final = brut × (1 - perte%/100)")
+
+            # En-têtes colonnes
+            hc1, hc2, hc3, hc4 = st.columns([3, 1.5, 1.5, 1.5])
+            hc1.markdown("**Ingrédient**")
+            hc2.markdown("**Brut (kg)**")
+            hc3.markdown("**Perte (%)**")
+            hc4.markdown("**Prix/kg (€)**")
+
             ing_rows = []
             for i in range(10):
-                ca, cb, cc, cd, ce = st.columns([3, 1.5, 1.5, 1.5, 1])
-                with ca: nom_i = st.text_input(f"Ingrédient {i+1}", key=f"ing_nom_{i}", label_visibility="collapsed" if i > 0 else "visible")
-                with cb: brut_i = st.number_input("Brut kg", key=f"ing_brut_{i}", min_value=0.0, step=0.01, format="%.3f", label_visibility="collapsed" if i > 0 else "visible")
-                with cc: net_i  = st.number_input("Net kg",  key=f"ing_net_{i}",  min_value=0.0, step=0.01, format="%.3f", label_visibility="collapsed" if i > 0 else "visible")
-                with cd: prix_i = st.number_input("Prix/kg €", key=f"ing_prix_{i}", min_value=0.0, step=0.1, format="%.2f", label_visibility="collapsed" if i > 0 else "visible")
+                ca, cb, cc, cd = st.columns([3, 1.5, 1.5, 1.5])
+                with ca: nom_i   = st.text_input(f"ing_{i}", key=f"ing_nom_{i}",  label_visibility="collapsed")
+                with cb: brut_i  = st.number_input("b", key=f"ing_brut_{i}",  min_value=0.0, step=0.01,  format="%.3f", label_visibility="collapsed")
+                with cc: perte_i = st.number_input("p", key=f"ing_perte_{i}", min_value=0.0, max_value=100.0, step=0.5, format="%.1f", label_visibility="collapsed")
+                with cd: prix_i  = st.number_input("px", key=f"ing_prix_{i}",  min_value=0.0, step=0.1,  format="%.2f", label_visibility="collapsed")
                 if nom_i.strip():
-                    ing_rows.append({"nom": nom_i.strip(), "poids_brut_kg": brut_i, "poids_net_kg": net_i, "prix_unitaire": prix_i})
+                    net_calc = round(brut_i * (1 - perte_i / 100), 4)
+                    ing_rows.append({
+                        "nom": nom_i.strip(),
+                        "poids_brut_kg": brut_i,
+                        "taux_perte_pct": perte_i,
+                        "prix_unitaire": prix_i,
+                    })
 
-            submitted_rec = st.form_submit_button("Enregistrer la recette")
+            submitted_rec = st.form_submit_button("Enregistrer la recette", type="primary")
             if submitted_rec:
                 if not f_nom.strip():
                     st.error("Le nom de la recette est obligatoire.")
@@ -1191,7 +1449,6 @@ elif page == "Fiches Techniques":
                         "ingredients": ing_rows,
                         "created_at": str(date.today())
                     })
-                    # Mettre à jour le catalogue prix
                     for ing in ing_rows:
                         ing_id = ing["nom"].lower().replace(" ", "_").replace("'", "")
                         _db.collection(COLLECTION_INGREDIENTS).document(ing_id).set({
@@ -1227,7 +1484,7 @@ elif page == "Factures":
                 media_type = "image/jpeg"
                 if img_src.name.endswith(".png") if hasattr(img_src, "name") else False:
                     media_type = "image/png"
-                result = _extract_facture_claude(img_src.getvalue(), media_type)
+                result = _extract_facture_vision(img_src.getvalue(), media_type)
 
             if "error" in result:
                 st.error(f"Erreur : {result['error']}")
