@@ -10,10 +10,15 @@ from google.cloud import firestore
 from google.oauth2 import service_account
 import json
 import warnings
+import uuid
+from datetime import date
 warnings.filterwarnings('ignore')
 
 # Initialisation Firebase — st.secrets en production, firebase-key.json en local
 FIRESTORE_COLLECTION = "kpi_2026"
+COLLECTION_RECETTES   = "recettes"
+COLLECTION_INGREDIENTS = "ingredients"
+COLLECTION_FACTURES   = "factures"
 
 def _get_firestore_client():
     """
@@ -157,6 +162,197 @@ def load_data():
 
     return df.dropna(subset=['Semaine']).sort_values('Semaine').reset_index(drop=True)
 
+
+# --- FONCTIONS RECETTES / INGRÉDIENTS / FACTURES ---
+@st.cache_data(ttl=60)
+def load_recettes():
+    docs = _db.collection(COLLECTION_RECETTES).stream()
+    return [{"id": d.id, **d.to_dict()} for d in docs]
+
+@st.cache_data(ttl=60)
+def load_ingredients():
+    docs = _db.collection(COLLECTION_INGREDIENTS).stream()
+    return {d.to_dict()["nom"]: {"id": d.id, **d.to_dict()} for d in docs}
+
+@st.cache_data(ttl=60)
+def load_factures():
+    docs = _db.collection(COLLECTION_FACTURES).stream()
+    return sorted([{"id": d.id, **d.to_dict()} for d in docs],
+                  key=lambda x: x.get("date", ""), reverse=True)
+
+def _calcul_fiche(recette, prix_dict):
+    """Calcule les coûts d'une recette selon le catalogue de prix."""
+    rows = []
+    total_cout = 0.0
+    for ing in recette.get("ingredients", []):
+        brut = float(ing.get("poids_brut_kg", 0))
+        net  = float(ing.get("poids_net_kg", 0))
+        perte_pct = round((brut - net) / brut * 100, 1) if brut > 0 else 0
+        prix = prix_dict.get(ing["nom"], {}).get("prix_unitaire", ing.get("prix_unitaire", 0))
+        cout = round(net * float(prix), 2)
+        total_cout += cout
+        rows.append({
+            "Ingrédient": ing["nom"],
+            "Brut (kg)": brut,
+            "Net (kg)": net,
+            "Perte %": f"{perte_pct}%",
+            "Prix/kg (€)": round(float(prix), 2),
+            "Coût (€)": cout,
+        })
+    nb = recette.get("nb_couverts", 1) or 1
+    return rows, round(total_cout, 2), round(total_cout / nb, 2)
+
+def seed_recettes_fictives():
+    """Insère 10 recettes fictives si la collection est vide."""
+    recettes = [
+        {"nom": "Blanquette de veau", "categorie": "Chaud", "nb_couverts": 10,
+         "ingredients": [
+             {"nom": "Veau épaule", "poids_brut_kg": 2.5, "poids_net_kg": 2.1, "prix_unitaire": 18.5},
+             {"nom": "Carottes", "poids_brut_kg": 0.5, "poids_net_kg": 0.42, "prix_unitaire": 1.2},
+             {"nom": "Oignons", "poids_brut_kg": 0.3, "poids_net_kg": 0.25, "prix_unitaire": 0.9},
+             {"nom": "Crème fraîche", "poids_brut_kg": 0.4, "poids_net_kg": 0.4, "prix_unitaire": 3.5},
+             {"nom": "Champignons", "poids_brut_kg": 0.3, "poids_net_kg": 0.25, "prix_unitaire": 4.2},
+         ]},
+        {"nom": "Ratatouille provençale", "categorie": "Légumerie", "nb_couverts": 8,
+         "ingredients": [
+             {"nom": "Courgettes", "poids_brut_kg": 0.8, "poids_net_kg": 0.72, "prix_unitaire": 1.8},
+             {"nom": "Aubergines", "poids_brut_kg": 0.6, "poids_net_kg": 0.52, "prix_unitaire": 2.1},
+             {"nom": "Poivrons rouges", "poids_brut_kg": 0.5, "poids_net_kg": 0.42, "prix_unitaire": 2.8},
+             {"nom": "Tomates", "poids_brut_kg": 0.8, "poids_net_kg": 0.72, "prix_unitaire": 1.5},
+             {"nom": "Oignons", "poids_brut_kg": 0.3, "poids_net_kg": 0.25, "prix_unitaire": 0.9},
+             {"nom": "Huile d'olive", "poids_brut_kg": 0.08, "poids_net_kg": 0.08, "prix_unitaire": 6.0},
+         ]},
+        {"nom": "California Roll", "categorie": "Sushi", "nb_couverts": 24,
+         "ingredients": [
+             {"nom": "Riz à sushi", "poids_brut_kg": 0.5, "poids_net_kg": 0.5, "prix_unitaire": 2.4},
+             {"nom": "Surimi", "poids_brut_kg": 0.2, "poids_net_kg": 0.18, "prix_unitaire": 8.0},
+             {"nom": "Avocat", "poids_brut_kg": 0.3, "poids_net_kg": 0.18, "prix_unitaire": 4.5},
+             {"nom": "Concombre", "poids_brut_kg": 0.2, "poids_net_kg": 0.17, "prix_unitaire": 1.2},
+             {"nom": "Feuilles de nori", "poids_brut_kg": 0.05, "poids_net_kg": 0.05, "prix_unitaire": 22.0},
+         ]},
+        {"nom": "Soupe à l'oignon gratinée", "categorie": "Chaud", "nb_couverts": 6,
+         "ingredients": [
+             {"nom": "Oignons", "poids_brut_kg": 1.2, "poids_net_kg": 1.0, "prix_unitaire": 0.9},
+             {"nom": "Beurre", "poids_brut_kg": 0.08, "poids_net_kg": 0.08, "prix_unitaire": 9.0},
+             {"nom": "Farine", "poids_brut_kg": 0.04, "poids_net_kg": 0.04, "prix_unitaire": 1.1},
+             {"nom": "Bouillon bœuf", "poids_brut_kg": 1.5, "poids_net_kg": 1.5, "prix_unitaire": 0.8},
+             {"nom": "Gruyère râpé", "poids_brut_kg": 0.15, "poids_net_kg": 0.15, "prix_unitaire": 12.0},
+             {"nom": "Pain baguette", "poids_brut_kg": 0.2, "poids_net_kg": 0.2, "prix_unitaire": 3.5},
+         ]},
+        {"nom": "Salade niçoise", "categorie": "Légumerie", "nb_couverts": 6,
+         "ingredients": [
+             {"nom": "Thon en boîte", "poids_brut_kg": 0.3, "poids_net_kg": 0.28, "prix_unitaire": 10.0},
+             {"nom": "Haricots verts", "poids_brut_kg": 0.4, "poids_net_kg": 0.35, "prix_unitaire": 3.2},
+             {"nom": "Tomates", "poids_brut_kg": 0.5, "poids_net_kg": 0.45, "prix_unitaire": 1.5},
+             {"nom": "Œufs", "poids_brut_kg": 0.18, "poids_net_kg": 0.15, "prix_unitaire": 5.5},
+             {"nom": "Olives noires", "poids_brut_kg": 0.1, "poids_net_kg": 0.09, "prix_unitaire": 7.0},
+             {"nom": "Anchois", "poids_brut_kg": 0.06, "poids_net_kg": 0.05, "prix_unitaire": 18.0},
+         ]},
+        {"nom": "Quiche lorraine", "categorie": "Chaud", "nb_couverts": 8,
+         "ingredients": [
+             {"nom": "Pâte brisée", "poids_brut_kg": 0.25, "poids_net_kg": 0.25, "prix_unitaire": 4.0},
+             {"nom": "Lardons fumés", "poids_brut_kg": 0.2, "poids_net_kg": 0.18, "prix_unitaire": 7.5},
+             {"nom": "Œufs", "poids_brut_kg": 0.25, "poids_net_kg": 0.22, "prix_unitaire": 5.5},
+             {"nom": "Crème fraîche", "poids_brut_kg": 0.3, "poids_net_kg": 0.3, "prix_unitaire": 3.5},
+             {"nom": "Gruyère râpé", "poids_brut_kg": 0.1, "poids_net_kg": 0.1, "prix_unitaire": 12.0},
+         ]},
+        {"nom": "Bœuf bourguignon", "categorie": "Chaud", "nb_couverts": 10,
+         "ingredients": [
+             {"nom": "Bœuf bourguignon", "poids_brut_kg": 2.0, "poids_net_kg": 1.7, "prix_unitaire": 14.0},
+             {"nom": "Lardons fumés", "poids_brut_kg": 0.2, "poids_net_kg": 0.18, "prix_unitaire": 7.5},
+             {"nom": "Carottes", "poids_brut_kg": 0.5, "poids_net_kg": 0.42, "prix_unitaire": 1.2},
+             {"nom": "Oignons", "poids_brut_kg": 0.3, "poids_net_kg": 0.25, "prix_unitaire": 0.9},
+             {"nom": "Champignons", "poids_brut_kg": 0.3, "poids_net_kg": 0.26, "prix_unitaire": 4.2},
+             {"nom": "Vin rouge", "poids_brut_kg": 0.75, "poids_net_kg": 0.75, "prix_unitaire": 4.0},
+         ]},
+        {"nom": "Gratin dauphinois", "categorie": "Légumerie", "nb_couverts": 8,
+         "ingredients": [
+             {"nom": "Pommes de terre", "poids_brut_kg": 1.5, "poids_net_kg": 1.2, "prix_unitaire": 0.8},
+             {"nom": "Crème fraîche", "poids_brut_kg": 0.5, "poids_net_kg": 0.5, "prix_unitaire": 3.5},
+             {"nom": "Lait entier", "poids_brut_kg": 0.3, "poids_net_kg": 0.3, "prix_unitaire": 1.1},
+             {"nom": "Gruyère râpé", "poids_brut_kg": 0.12, "poids_net_kg": 0.12, "prix_unitaire": 12.0},
+             {"nom": "Ail", "poids_brut_kg": 0.02, "poids_net_kg": 0.015, "prix_unitaire": 5.0},
+         ]},
+        {"nom": "Taboulé libanais", "categorie": "Mix", "nb_couverts": 8,
+         "ingredients": [
+             {"nom": "Semoule fine", "poids_brut_kg": 0.3, "poids_net_kg": 0.3, "prix_unitaire": 1.5},
+             {"nom": "Tomates", "poids_brut_kg": 0.6, "poids_net_kg": 0.54, "prix_unitaire": 1.5},
+             {"nom": "Concombre", "poids_brut_kg": 0.3, "poids_net_kg": 0.25, "prix_unitaire": 1.2},
+             {"nom": "Persil plat", "poids_brut_kg": 0.15, "poids_net_kg": 0.12, "prix_unitaire": 6.0},
+             {"nom": "Menthe fraîche", "poids_brut_kg": 0.05, "poids_net_kg": 0.04, "prix_unitaire": 8.0},
+             {"nom": "Citrons", "poids_brut_kg": 0.2, "poids_net_kg": 0.18, "prix_unitaire": 2.0},
+             {"nom": "Huile d'olive", "poids_brut_kg": 0.06, "poids_net_kg": 0.06, "prix_unitaire": 6.0},
+         ]},
+        {"nom": "Velouté de légumes", "categorie": "Légumerie", "nb_couverts": 6,
+         "ingredients": [
+             {"nom": "Courgettes", "poids_brut_kg": 0.5, "poids_net_kg": 0.45, "prix_unitaire": 1.8},
+             {"nom": "Carottes", "poids_brut_kg": 0.4, "poids_net_kg": 0.34, "prix_unitaire": 1.2},
+             {"nom": "Pommes de terre", "poids_brut_kg": 0.3, "poids_net_kg": 0.24, "prix_unitaire": 0.8},
+             {"nom": "Oignons", "poids_brut_kg": 0.2, "poids_net_kg": 0.17, "prix_unitaire": 0.9},
+             {"nom": "Crème fraîche", "poids_brut_kg": 0.15, "poids_net_kg": 0.15, "prix_unitaire": 3.5},
+             {"nom": "Bouillon légumes", "poids_brut_kg": 1.0, "poids_net_kg": 1.0, "prix_unitaire": 0.5},
+         ]},
+    ]
+    today = str(date.today())
+    # Seed ingrédients catalogue (prix uniques par ingrédient)
+    prix_vus = {}
+    for rec in recettes:
+        for ing in rec["ingredients"]:
+            if ing["nom"] not in prix_vus:
+                prix_vus[ing["nom"]] = ing["prix_unitaire"]
+    for nom, prix in prix_vus.items():
+        ing_id = nom.lower().replace(" ", "_").replace("'", "").replace("é", "e").replace("è", "e").replace("ê", "e")
+        _db.collection(COLLECTION_INGREDIENTS).document(ing_id).set({
+            "nom": nom, "prix_unitaire": prix, "unite": "kg",
+            "fournisseur": "", "updated_at": today
+        })
+    # Seed recettes
+    for rec in recettes:
+        rec_id = str(uuid.uuid4())
+        _db.collection(COLLECTION_RECETTES).document(rec_id).set({**rec, "created_at": today})
+    st.cache_data.clear()
+
+def _extract_facture_claude(image_bytes: bytes, media_type: str = "image/jpeg") -> dict:
+    """Envoie une image de facture à Claude Opus et retourne les données extraites."""
+    try:
+        import anthropic
+        api_key = st.secrets.get("ANTHROPIC_API_KEY", os.environ.get("ANTHROPIC_API_KEY", ""))
+        if not api_key:
+            return {"error": "Clé ANTHROPIC_API_KEY manquante dans st.secrets"}
+        client = anthropic.Anthropic(api_key=api_key)
+        img_b64 = base64.b64encode(image_bytes).decode("utf-8")
+        prompt = """Analyse cette facture et retourne UNIQUEMENT un JSON valide avec cette structure exacte :
+{
+  "fournisseur": "nom du fournisseur",
+  "date": "YYYY-MM-DD",
+  "numero": "numéro de facture",
+  "lignes": [
+    {"article": "nom article", "quantite": 0.0, "unite": "kg", "prix_unitaire": 0.0, "total_ht": 0.0}
+  ],
+  "total_ht": 0.0,
+  "tva": 0.0,
+  "total_ttc": 0.0
+}
+Si une valeur est introuvable, utilise "" pour les strings et 0.0 pour les nombres. Retourne uniquement le JSON, sans texte autour."""
+        response = client.messages.create(
+            model="claude-opus-4-6",
+            max_tokens=2000,
+            messages=[{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": img_b64}},
+                {"type": "text", "text": prompt}
+            ]}]
+        )
+        raw = response.content[0].text.strip()
+        # Nettoyer les balises markdown si présentes
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        return json.loads(raw.strip())
+    except Exception as e:
+        return {"error": str(e)}
+
+
 # --- CHARGEMENT DES DONNÉES ---
 try:
     data = load_data()
@@ -166,6 +362,13 @@ try:
 except Exception as e:
     st.error(f"Erreur lors de la lecture du fichier : {e}")
     st.stop()
+
+# Seed recettes fictives si collection vide
+try:
+    if not _db.collection(COLLECTION_RECETTES).limit(1).get():
+        seed_recettes_fictives()
+except Exception:
+    pass
 
 # --- EMOJIS MAPPING ---
 POSTES_EMOJIS = {
@@ -179,6 +382,8 @@ POSTES_EMOJIS = {
     "Désinfection": "🧼 Désinfection",
     "Traçabilité": "📋 Traçabilité",
     "CF tampon": "❄️ CF tampon",
+    "Fiches Techniques": "📖 Fiches Techniques",
+    "Factures": "🧾 Factures",
     "Saisie de données": "✏️ Saisie de données"
 }
 
@@ -887,3 +1092,282 @@ elif page == "Saisie de données":
                 st.rerun()
         else:
             st.info("Aucune semaine disponible à supprimer.")
+
+# ─────────────────────────────────────────────────────────
+# PAGE : FICHES TECHNIQUES RECETTES
+# ─────────────────────────────────────────────────────────
+elif page == "Fiches Techniques":
+    st.title("📖 Fiches Techniques Recettes")
+
+    recettes_list = load_recettes()
+    prix_dict     = load_ingredients()
+
+    if not recettes_list:
+        st.info("Aucune recette trouvée. Ajoutez-en une ci-dessous.")
+    else:
+        # ── Sélecteur recette ──────────────────────────────
+        noms = [r["nom"] for r in recettes_list]
+        col_sel, col_btn = st.columns([4, 1])
+        with col_sel:
+            nom_choisi = st.selectbox("Sélectionner une recette :", noms)
+        recette = next((r for r in recettes_list if r["nom"] == nom_choisi), None)
+
+        if recette:
+            rows, cout_total, cout_couvert = _calcul_fiche(recette, prix_dict)
+
+            # ── KPIs ──────────────────────────────────────
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Catégorie", recette.get("categorie", "—"))
+            k2.metric("Couverts", recette.get("nb_couverts", "—"))
+            k3.metric("Coût matière total", f"{cout_total:.2f} €")
+            k4.metric("Coût / couvert", f"{cout_couvert:.2f} €")
+
+            st.divider()
+
+            # ── Tableau ingrédients ───────────────────────
+            st.subheader("Composition")
+            df_ing = pd.DataFrame(rows)
+            # Barre de progression visuelle pour la perte
+            st.dataframe(
+                df_ing,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Brut (kg)":   st.column_config.NumberColumn(format="%.3f kg"),
+                    "Net (kg)":    st.column_config.NumberColumn(format="%.3f kg"),
+                    "Prix/kg (€)": st.column_config.NumberColumn(format="%.2f €"),
+                    "Coût (€)":    st.column_config.NumberColumn(format="%.2f €"),
+                }
+            )
+
+            # ── Répartition coûts (camembert) ────────────
+            if rows:
+                fig_pie = px.pie(
+                    df_ing, values="Coût (€)", names="Ingrédient",
+                    title="Répartition du coût matière",
+                    hole=0.4,
+                    color_discrete_sequence=px.colors.qualitative.Pastel
+                )
+                fig_pie.update_layout(height=320, margin=dict(t=40, b=0))
+                _, col_pie, _ = st.columns([1, 2, 1])
+                with col_pie:
+                    st.plotly_chart(fig_pie, use_container_width=True)
+
+    st.divider()
+
+    # ── Formulaire ajout / édition recette ────────────────
+    with st.expander("➕ Ajouter / Modifier une recette", expanded=False):
+        with st.form("form_recette"):
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                f_nom = st.text_input("Nom de la recette")
+            with c2:
+                f_cat = st.selectbox("Catégorie", ["Chaud", "Légumerie", "Sushi", "Mix", "Mélange", "Désinfection", "Autre"])
+            with c3:
+                f_couverts = st.number_input("Nombre de couverts", min_value=1, value=6, step=1)
+
+            st.markdown("**Ingrédients** (ajoutez jusqu'à 10)")
+            ing_rows = []
+            for i in range(10):
+                ca, cb, cc, cd, ce = st.columns([3, 1.5, 1.5, 1.5, 1])
+                with ca: nom_i = st.text_input(f"Ingrédient {i+1}", key=f"ing_nom_{i}", label_visibility="collapsed" if i > 0 else "visible")
+                with cb: brut_i = st.number_input("Brut kg", key=f"ing_brut_{i}", min_value=0.0, step=0.01, format="%.3f", label_visibility="collapsed" if i > 0 else "visible")
+                with cc: net_i  = st.number_input("Net kg",  key=f"ing_net_{i}",  min_value=0.0, step=0.01, format="%.3f", label_visibility="collapsed" if i > 0 else "visible")
+                with cd: prix_i = st.number_input("Prix/kg €", key=f"ing_prix_{i}", min_value=0.0, step=0.1, format="%.2f", label_visibility="collapsed" if i > 0 else "visible")
+                if nom_i.strip():
+                    ing_rows.append({"nom": nom_i.strip(), "poids_brut_kg": brut_i, "poids_net_kg": net_i, "prix_unitaire": prix_i})
+
+            submitted_rec = st.form_submit_button("Enregistrer la recette")
+            if submitted_rec:
+                if not f_nom.strip():
+                    st.error("Le nom de la recette est obligatoire.")
+                elif not ing_rows:
+                    st.error("Ajoutez au moins un ingrédient.")
+                else:
+                    rec_id = str(uuid.uuid4())
+                    _db.collection(COLLECTION_RECETTES).document(rec_id).set({
+                        "nom": f_nom.strip(), "categorie": f_cat,
+                        "nb_couverts": int(f_couverts),
+                        "ingredients": ing_rows,
+                        "created_at": str(date.today())
+                    })
+                    # Mettre à jour le catalogue prix
+                    for ing in ing_rows:
+                        ing_id = ing["nom"].lower().replace(" ", "_").replace("'", "")
+                        _db.collection(COLLECTION_INGREDIENTS).document(ing_id).set({
+                            "nom": ing["nom"], "prix_unitaire": ing["prix_unitaire"],
+                            "unite": "kg", "fournisseur": "", "updated_at": str(date.today())
+                        }, merge=True)
+                    st.cache_data.clear()
+                    st.success(f"Recette '{f_nom}' enregistrée !")
+                    st.rerun()
+
+# ─────────────────────────────────────────────────────────
+# PAGE : FACTURES
+# ─────────────────────────────────────────────────────────
+elif page == "Factures":
+    st.title("🧾 Gestion des Factures")
+
+    factures_list = load_factures()
+    prix_dict     = load_ingredients()
+
+    # ── Onglets Scanner / Manuel / Liste ──────────────────
+    tab_scan, tab_manuel, tab_liste = st.tabs(["📸 Scanner une facture", "✏️ Saisie manuelle", "📋 Liste des factures"])
+
+    with tab_scan:
+        st.subheader("Extraction automatique par photo")
+        st.info("Prenez une photo ou importez l'image de votre facture. Claude Opus analysera et extraira les données automatiquement.")
+
+        uploaded = st.file_uploader("Choisir une image de facture", type=["jpg", "jpeg", "png", "webp"], key="facture_upload")
+        camera   = st.camera_input("Ou prendre une photo", key="facture_camera")
+        img_src  = uploaded or camera
+
+        if img_src and st.button("Analyser la facture", type="primary"):
+            with st.spinner("Claude analyse la facture..."):
+                media_type = "image/jpeg"
+                if img_src.name.endswith(".png") if hasattr(img_src, "name") else False:
+                    media_type = "image/png"
+                result = _extract_facture_claude(img_src.getvalue(), media_type)
+
+            if "error" in result:
+                st.error(f"Erreur : {result['error']}")
+            else:
+                st.session_state["ocr_result"] = result
+                st.success("Extraction réussie ! Vérifiez et validez les données ci-dessous.")
+
+        # Formulaire de validation OCR
+        if "ocr_result" in st.session_state:
+            ocr = st.session_state["ocr_result"]
+            st.divider()
+            st.subheader("Vérification des données extraites")
+            with st.form("form_ocr_validation"):
+                co1, co2, co3 = st.columns(3)
+                with co1: v_fourn  = st.text_input("Fournisseur", value=ocr.get("fournisseur", ""))
+                with co2: v_date   = st.text_input("Date (YYYY-MM-DD)", value=ocr.get("date", str(date.today())))
+                with co3: v_num    = st.text_input("N° facture", value=ocr.get("numero", ""))
+
+                st.markdown("**Lignes de la facture**")
+                lignes_valid = []
+                for i, lg in enumerate(ocr.get("lignes", [])[:20]):
+                    lc1, lc2, lc3, lc4 = st.columns([3, 1, 1.5, 1.5])
+                    with lc1: art = st.text_input(f"Article {i+1}", value=lg.get("article",""), key=f"art_{i}")
+                    with lc2: qty = st.number_input("Qté", value=float(lg.get("quantite",0)), key=f"qty_{i}", step=0.1)
+                    with lc3: pu  = st.number_input("Prix unitaire", value=float(lg.get("prix_unitaire",0)), key=f"pu_{i}", step=0.01)
+                    with lc4: tht = st.number_input("Total HT", value=float(lg.get("total_ht",0)), key=f"tht_{i}", step=0.01)
+                    if art.strip():
+                        lignes_valid.append({"article": art, "quantite": qty, "unite": lg.get("unite","kg"), "prix_unitaire": pu, "total_ht": tht})
+
+                cf1, cf2, cf3 = st.columns(3)
+                with cf1: v_tht = st.number_input("Total HT (€)", value=float(ocr.get("total_ht", 0)), step=0.01)
+                with cf2: v_tva = st.number_input("TVA (€)",      value=float(ocr.get("tva", 0)), step=0.01)
+                with cf3: v_ttc = st.number_input("Total TTC (€)",value=float(ocr.get("total_ttc", 0)), step=0.01)
+
+                col_save, col_prix = st.columns(2)
+                with col_save: save_btn  = st.form_submit_button("💾 Enregistrer la facture", type="primary")
+                with col_prix: maj_btn   = st.form_submit_button("💰 Enregistrer + MAJ prix ingrédients")
+
+                if save_btn or maj_btn:
+                    fac_doc = {
+                        "fournisseur": v_fourn, "date": v_date, "numero": v_num,
+                        "lignes": lignes_valid,
+                        "total_ht": v_tht, "tva": v_tva, "total_ttc": v_ttc,
+                        "statut": "validée", "created_at": str(date.today())
+                    }
+                    _db.collection(COLLECTION_FACTURES).document(str(uuid.uuid4())).set(fac_doc)
+                    if maj_btn:
+                        for lg in lignes_valid:
+                            if lg["article"].strip() and lg["prix_unitaire"] > 0:
+                                ing_id = lg["article"].lower().replace(" ", "_").replace("'", "")
+                                _db.collection(COLLECTION_INGREDIENTS).document(ing_id).set({
+                                    "nom": lg["article"], "prix_unitaire": lg["prix_unitaire"],
+                                    "unite": lg.get("unite", "kg"),
+                                    "fournisseur": v_fourn, "updated_at": str(date.today())
+                                }, merge=True)
+                        st.success("Facture enregistrée et prix ingrédients mis à jour !")
+                    else:
+                        st.success("Facture enregistrée !")
+                    del st.session_state["ocr_result"]
+                    st.cache_data.clear()
+                    st.rerun()
+
+    with tab_manuel:
+        st.subheader("Saisie manuelle d'une facture")
+        with st.form("form_facture_manuelle"):
+            m1, m2, m3 = st.columns(3)
+            with m1: m_fourn = st.text_input("Fournisseur")
+            with m2: m_date  = st.text_input("Date (YYYY-MM-DD)", value=str(date.today()))
+            with m3: m_num   = st.text_input("N° facture")
+
+            st.markdown("**Lignes**")
+            m_lignes = []
+            for i in range(8):
+                ml1, ml2, ml3, ml4, ml5 = st.columns([3, 1, 1, 1.5, 1.5])
+                with ml1: m_art = st.text_input(f"Article {i+1}", key=f"m_art_{i}", label_visibility="collapsed" if i>0 else "visible")
+                with ml2: m_qty = st.number_input("Qté", key=f"m_qty_{i}", min_value=0.0, step=0.1, label_visibility="collapsed" if i>0 else "visible")
+                with ml3: m_uni = st.text_input("Unité", key=f"m_uni_{i}", value="kg", label_visibility="collapsed" if i>0 else "visible")
+                with ml4: m_pu  = st.number_input("PU €", key=f"m_pu_{i}",  min_value=0.0, step=0.01, label_visibility="collapsed" if i>0 else "visible")
+                with ml5: m_tht = st.number_input("Total HT", key=f"m_tht_{i}", min_value=0.0, step=0.01, label_visibility="collapsed" if i>0 else "visible")
+                if m_art.strip():
+                    m_lignes.append({"article": m_art, "quantite": m_qty, "unite": m_uni, "prix_unitaire": m_pu, "total_ht": m_tht})
+
+            mt1, mt2, mt3 = st.columns(3)
+            with mt1: m_tht_tot = st.number_input("Total HT (€)", min_value=0.0, step=0.01, key="m_tht_tot")
+            with mt2: m_tva_tot = st.number_input("TVA (€)",       min_value=0.0, step=0.01, key="m_tva_tot")
+            with mt3: m_ttc_tot = st.number_input("Total TTC (€)", min_value=0.0, step=0.01, key="m_ttc_tot")
+
+            m_sub = st.form_submit_button("Enregistrer", type="primary")
+            if m_sub:
+                if not m_fourn.strip():
+                    st.error("Le fournisseur est obligatoire.")
+                else:
+                    _db.collection(COLLECTION_FACTURES).document(str(uuid.uuid4())).set({
+                        "fournisseur": m_fourn, "date": m_date, "numero": m_num,
+                        "lignes": m_lignes,
+                        "total_ht": m_tht_tot, "tva": m_tva_tot, "total_ttc": m_ttc_tot,
+                        "statut": "validée", "created_at": str(date.today())
+                    })
+                    st.cache_data.clear()
+                    st.success("Facture enregistrée !")
+                    st.rerun()
+
+    with tab_liste:
+        st.subheader("Historique des factures")
+        if not factures_list:
+            st.info("Aucune facture enregistrée.")
+        else:
+            # Tableau récapitulatif
+            df_fac = pd.DataFrame([{
+                "Date": f.get("date", ""),
+                "Fournisseur": f.get("fournisseur", ""),
+                "N° Facture": f.get("numero", ""),
+                "Total HT (€)": f.get("total_ht", 0),
+                "TVA (€)": f.get("tva", 0),
+                "Total TTC (€)": f.get("total_ttc", 0),
+                "Statut": f.get("statut", ""),
+            } for f in factures_list])
+            st.dataframe(df_fac, use_container_width=True, hide_index=True,
+                column_config={
+                    "Total HT (€)":  st.column_config.NumberColumn(format="%.2f €"),
+                    "TVA (€)":       st.column_config.NumberColumn(format="%.2f €"),
+                    "Total TTC (€)": st.column_config.NumberColumn(format="%.2f €"),
+                })
+
+            # KPIs achats
+            st.divider()
+            total_ht_all  = sum(f.get("total_ht", 0)  for f in factures_list)
+            total_ttc_all = sum(f.get("total_ttc", 0) for f in factures_list)
+            nb_fourn = len(set(f.get("fournisseur","") for f in factures_list))
+            fk1, fk2, fk3 = st.columns(3)
+            fk1.metric("Total achats HT", f"{total_ht_all:.2f} €")
+            fk2.metric("Total achats TTC", f"{total_ttc_all:.2f} €")
+            fk3.metric("Fournisseurs distincts", nb_fourn)
+
+            # Détail facture sélectionnée
+            st.divider()
+            choix_fac = st.selectbox("Voir le détail d'une facture :",
+                [f"{f.get('date','')} — {f.get('fournisseur','')} — {f.get('numero','')}" for f in factures_list])
+            idx = [f"{f.get('date','')} — {f.get('fournisseur','')} — {f.get('numero','')}" for f in factures_list].index(choix_fac)
+            fac_detail = factures_list[idx]
+            lignes_detail = fac_detail.get("lignes", [])
+            if lignes_detail:
+                st.dataframe(pd.DataFrame(lignes_detail), use_container_width=True, hide_index=True)
