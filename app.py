@@ -501,29 +501,41 @@ Règles impératives :
 
         data = _json.loads(raw)
 
-        # Normaliser les lignes pour le formulaire existant
+        # Normaliser les lignes — ref séparée, total HT calculé si absent
         lignes_norm = []
         for lg in data.get("lignes", []):
-            ref = str(lg.get("reference", "")).strip()
+            ref  = str(lg.get("reference", "")).strip()
             desc = str(lg.get("article", "")).strip()
-            article = f"{ref} {desc}".strip() if ref else desc
+            qty  = float(lg.get("quantite_livree") or lg.get("quantite_commandee") or 0)
+            prix = float(lg.get("prix_unitaire") or 0)
+            total_line = float(lg.get("total_ht") or 0)
+            if total_line == 0 and qty > 0 and prix > 0:
+                total_line = round(qty * prix, 2)
             lignes_norm.append({
-                "article": article,
-                "quantite": float(lg.get("quantite_livree") or lg.get("quantite_commandee") or 0),
-                "unite": str(lg.get("unite_livree") or lg.get("unite_commande") or "kg"),
-                "prix_unitaire": float(lg.get("prix_unitaire") or 0),
-                "total_ht": float(lg.get("total_ht") or 0),
+                "reference":    ref,
+                "article":      desc,
+                "quantite":     qty,
+                "unite":        str(lg.get("unite_livree") or lg.get("unite_commande") or "kg"),
+                "prix_unitaire": prix,
+                "total_ht":     total_line,
             })
+
+        # Total facture : depuis l'extraction ou somme des lignes
+        total_ht_extrait = float(data.get("total_ht") or 0)
+        total_ht_calc    = round(sum(lg["total_ht"] for lg in lignes_norm), 2)
+        total_ht_final   = total_ht_extrait if total_ht_extrait > 0 else total_ht_calc
+        tva_val  = float(data.get("tva") or 0)
+        ttc_val  = float(data.get("total_ttc") or 0)
 
         from datetime import date as _date
         return {
             "fournisseur": str(data.get("fournisseur", "")),
-            "date": str(data.get("date", "") or str(_date.today())),
-            "numero": str(data.get("numero", "")),
-            "lignes": lignes_norm,
-            "total_ht": float(data.get("total_ht") or 0),
-            "tva": float(data.get("tva") or 0),
-            "total_ttc": float(data.get("total_ttc") or 0),
+            "date":        str(data.get("date", "") or str(_date.today())),
+            "numero":      str(data.get("numero", "")),
+            "lignes":      lignes_norm,
+            "total_ht":    total_ht_final,
+            "tva":         tva_val,
+            "total_ttc":   ttc_val,
         }
 
     except _json.JSONDecodeError as e:
@@ -1681,15 +1693,19 @@ elif page == "Factures":
                 with co3: v_num    = st.text_input("N° facture", value=ocr.get("numero", ""))
 
                 st.markdown("**Lignes de la facture**")
+                st.caption("Réf · Article · Qté · Unité · Prix/unité · Total HT")
                 lignes_valid = []
-                for i, lg in enumerate(ocr.get("lignes", [])[:20]):
-                    lc1, lc2, lc3, lc4 = st.columns([3, 1, 1.5, 1.5])
-                    with lc1: art = st.text_input(f"Article {i+1}", value=lg.get("article",""), key=f"art_{i}")
-                    with lc2: qty = st.number_input("Qté", value=float(lg.get("quantite",0)), key=f"qty_{i}", step=0.1)
-                    with lc3: pu  = st.number_input("Prix unitaire", value=float(lg.get("prix_unitaire",0)), key=f"pu_{i}", step=0.01)
-                    with lc4: tht = st.number_input("Total HT", value=float(lg.get("total_ht",0)), key=f"tht_{i}", step=0.01)
+                for i, lg in enumerate(ocr.get("lignes", [])[:50]):
+                    lc1, lc2, lc3, lc4, lc5, lc6 = st.columns([1, 3, 0.9, 0.9, 1.2, 1.2])
+                    with lc1: ref = st.text_input("Réf",          value=lg.get("reference",""),    key=f"ref_{i}", label_visibility="collapsed", placeholder="Réf")
+                    with lc2: art = st.text_input("Article",       value=lg.get("article",""),      key=f"art_{i}", label_visibility="collapsed", placeholder="Article")
+                    with lc3: qty = st.number_input("Qté",         value=float(lg.get("quantite",0)),key=f"qty_{i}", step=0.001, format="%.3f", label_visibility="collapsed")
+                    with lc4: uni = st.text_input("Unité",         value=lg.get("unite","kg"),      key=f"uni_{i}", label_visibility="collapsed", placeholder="Unité")
+                    with lc5: pu  = st.number_input("Prix/u",      value=float(lg.get("prix_unitaire",0)), key=f"pu_{i}", step=0.001, format="%.3f", label_visibility="collapsed")
+                    default_tht = round(qty * pu, 2) if lg.get("total_ht", 0) == 0 else float(lg.get("total_ht", 0))
+                    with lc6: tht = st.number_input("Total HT",    value=default_tht,               key=f"tht_{i}", step=0.01, label_visibility="collapsed")
                     if art.strip():
-                        lignes_valid.append({"article": art, "quantite": qty, "unite": lg.get("unite","kg"), "prix_unitaire": pu, "total_ht": tht})
+                        lignes_valid.append({"reference": ref, "article": art, "quantite": qty, "unite": uni, "prix_unitaire": pu, "total_ht": tht})
 
                 cf1, cf2, cf3 = st.columns(3)
                 with cf1: v_tht = st.number_input("Total HT (€)", value=float(ocr.get("total_ht", 0)), step=0.01)
@@ -1708,18 +1724,37 @@ elif page == "Factures":
                         "statut": "validée", "created_at": str(date.today())
                     }
                     _db.collection(COLLECTION_FACTURES).document(str(uuid.uuid4())).set(fac_doc)
-                    if maj_btn:
-                        for lg in lignes_valid:
-                            if lg["article"].strip() and lg["prix_unitaire"] > 0:
-                                ing_id = lg["article"].lower().replace(" ", "_").replace("'", "")
-                                _db.collection(COLLECTION_INGREDIENTS).document(ing_id).set({
-                                    "nom": lg["article"], "prix_unitaire": lg["prix_unitaire"],
-                                    "unite": lg.get("unite", "kg"),
-                                    "fournisseur": v_fourn, "updated_at": str(date.today())
-                                }, merge=True)
-                        st.success("Facture enregistrée et prix ingrédients mis à jour !")
-                    else:
-                        st.success("Facture enregistrée !")
+
+                    # Sync ingrédients : créer les nouveaux, MAJ prix si bouton MAJ
+                    nb_crees, nb_maj = 0, 0
+                    existing_ids = {d.id for d in _db.collection(COLLECTION_INGREDIENTS).stream()}
+                    for lg in lignes_valid:
+                        nom = lg["article"].strip()
+                        if not nom:
+                            continue
+                        ing_id = nom.lower().replace(" ", "_").replace("'", "").replace("é","e").replace("è","e").replace("ê","e")
+                        ing_data = {
+                            "nom": nom,
+                            "reference": lg.get("reference", ""),
+                            "unite": lg.get("unite", "kg"),
+                            "fournisseur": v_fourn,
+                            "updated_at": str(date.today())
+                        }
+                        if ing_id not in existing_ids:
+                            # Nouvel ingrédient : toujours créer avec prix
+                            ing_data["prix_unitaire"] = lg["prix_unitaire"]
+                            _db.collection(COLLECTION_INGREDIENTS).document(ing_id).set(ing_data)
+                            nb_crees += 1
+                        elif maj_btn and lg["prix_unitaire"] > 0:
+                            # Ingrédient existant : MAJ prix seulement si bouton MAJ
+                            ing_data["prix_unitaire"] = lg["prix_unitaire"]
+                            _db.collection(COLLECTION_INGREDIENTS).document(ing_id).set(ing_data, merge=True)
+                            nb_maj += 1
+
+                    msg = "Facture enregistrée !"
+                    if nb_crees: msg += f" {nb_crees} nouvel(s) ingrédient(s) créé(s)."
+                    if nb_maj:   msg += f" {nb_maj} prix mis à jour."
+                    st.success(msg)
                     del st.session_state["ocr_result"]
                     st.cache_data.clear()
                     st.rerun()
