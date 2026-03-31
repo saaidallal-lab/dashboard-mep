@@ -3,4 +3,5 @@ pandas
 plotly
 google-cloud-firestore
 google-cloud-vision
+anthropic
 openpyxl

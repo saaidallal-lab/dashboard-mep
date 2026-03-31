@@ -415,23 +415,119 @@ def _parse_facture_text(text: str) -> dict:
     }
 
 
-def _extract_facture_vision(image_bytes: bytes, media_type: str = "image/jpeg") -> dict:
-    """Utilise Google Cloud Vision (gratuit 1000 req/mois) pour extraire le texte d'une facture."""
+def _extract_facture_claude(image_bytes: bytes, media_type: str = "image/jpeg") -> dict:
+    """Utilise Claude Vision pour extraire TOUTES les lignes d'une facture/BL avec haute précision."""
+    import re as _re
+    import json as _json
+    import base64 as _b64
+
     try:
-        from google.cloud import vision as gvision
-        creds = _get_gcp_credentials()
-        if creds is None:
-            return {"error": "Credentials GCP non trouvés."}
-        vision_client = gvision.ImageAnnotatorClient(credentials=creds)
-        image = gvision.Image(content=image_bytes)
-        response = vision_client.document_text_detection(image=image)
-        if response.error.message:
-            return {"error": response.error.message}
-        full_text = response.full_text_annotation.text if response.full_text_annotation else ""
-        if not full_text:
-            return {"error": "Aucun texte détecté dans l'image."}
-        result = _parse_facture_text(full_text)
-        return result
+        import anthropic as _anthropic
+    except ImportError:
+        return {"error": "Package 'anthropic' non installé. Ajoutez-le dans requirements.txt."}
+
+    # Récupération de la clé API
+    api_key = None
+    try:
+        api_key = st.secrets.get("ANTHROPIC_API_KEY")
+    except Exception:
+        pass
+    if not api_key:
+        import os
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return {"error": "Clé ANTHROPIC_API_KEY introuvable dans les secrets Streamlit."}
+
+    try:
+        client = _anthropic.Anthropic(api_key=api_key)
+        img_b64 = _b64.standard_b64encode(image_bytes).decode("utf-8")
+
+        prompt = """Analyse ce document (facture, bon de livraison, ou tout autre document commercial) et extrait TOUTES les données.
+
+Retourne UNIQUEMENT un objet JSON valide (sans texte avant ni après, sans bloc markdown) avec cette structure :
+{
+  "fournisseur": "nom complet du fournisseur",
+  "date": "YYYY-MM-DD",
+  "numero": "numéro de facture ou BL",
+  "lignes": [
+    {
+      "reference": "code/référence article si présent",
+      "article": "description complète du produit",
+      "quantite_commandee": 0.0,
+      "unite_commande": "COL/KG/SAC/BTE/SEA/etc",
+      "quantite_livree": 0.0,
+      "unite_livree": "KG/SAC/etc",
+      "prix_unitaire": 0.0,
+      "total_ht": 0.0
+    }
+  ],
+  "total_colis": 0,
+  "total_kg": 0.0,
+  "total_ht": 0.0,
+  "tva": 0.0,
+  "total_ttc": 0.0
+}
+
+Règles impératives :
+- Extrait ABSOLUMENT TOUTES les lignes produits sans en oublier une seule
+- La virgule est un séparateur décimal (ex : 6,800 = 6.8 en JSON)
+- Si une valeur est absente du document, utilise 0 ou ""
+- La date doit être au format YYYY-MM-DD (convertis si nécessaire)
+- N'inclus pas les lignes de total ou d'en-tête, uniquement les lignes produits"""
+
+        message = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=4096,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type,
+                            "data": img_b64,
+                        },
+                    },
+                    {"type": "text", "text": prompt},
+                ],
+            }],
+        )
+
+        raw = message.content[0].text.strip()
+        # Nettoyer les éventuels blocs markdown ```json ... ```
+        raw = _re.sub(r'^```(?:json)?\s*', '', raw)
+        raw = _re.sub(r'\s*```$', '', raw)
+
+        data = _json.loads(raw)
+
+        # Normaliser les lignes pour le formulaire existant
+        lignes_norm = []
+        for lg in data.get("lignes", []):
+            ref = str(lg.get("reference", "")).strip()
+            desc = str(lg.get("article", "")).strip()
+            article = f"{ref} {desc}".strip() if ref else desc
+            lignes_norm.append({
+                "article": article,
+                "quantite": float(lg.get("quantite_livree") or lg.get("quantite_commandee") or 0),
+                "unite": str(lg.get("unite_livree") or lg.get("unite_commande") or "kg"),
+                "prix_unitaire": float(lg.get("prix_unitaire") or 0),
+                "total_ht": float(lg.get("total_ht") or 0),
+            })
+
+        from datetime import date as _date
+        return {
+            "fournisseur": str(data.get("fournisseur", "")),
+            "date": str(data.get("date", "") or str(_date.today())),
+            "numero": str(data.get("numero", "")),
+            "lignes": lignes_norm,
+            "total_ht": float(data.get("total_ht") or 0),
+            "tva": float(data.get("tva") or 0),
+            "total_ttc": float(data.get("total_ttc") or 0),
+        }
+
+    except _json.JSONDecodeError as e:
+        return {"error": f"Réponse Claude non parsable en JSON : {e}"}
     except Exception as e:
         return {"error": str(e)}
 
@@ -1565,7 +1661,7 @@ elif page == "Factures":
                 media_type = "image/jpeg"
                 if img_src.name.endswith(".png") if hasattr(img_src, "name") else False:
                     media_type = "image/png"
-                result = _extract_facture_vision(img_src.getvalue(), media_type)
+                result = _extract_facture_claude(img_src.getvalue(), media_type)
 
             if "error" in result:
                 st.error(f"Erreur : {result['error']}")
