@@ -475,24 +475,30 @@ Règles impératives :
 - La date doit être au format YYYY-MM-DD (convertis si nécessaire)
 - N'inclus pas les lignes de total ou d'en-tête, uniquement les lignes produits"""
 
-        message = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=4096,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": media_type,
-                            "data": img_b64,
-                        },
-                    },
-                    {"type": "text", "text": prompt},
-                ],
-            }],
-        )
+        import time as _time
+        payload = [{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": img_b64}},
+                {"type": "text", "text": prompt},
+            ],
+        }]
+        message = None
+        for attempt in range(3):
+            try:
+                message = client.messages.create(
+                    model="claude-sonnet-4-6",
+                    max_tokens=4096,
+                    messages=payload,
+                )
+                break
+            except Exception as _e:
+                if attempt < 2 and "overloaded" in str(_e).lower():
+                    _time.sleep(5 * (attempt + 1))
+                else:
+                    raise
+        if message is None:
+            return {"error": "Serveur Anthropic surchargé. Réessaie dans quelques secondes."}
 
         raw = message.content[0].text.strip()
         # Nettoyer les éventuels blocs markdown ```json ... ```
