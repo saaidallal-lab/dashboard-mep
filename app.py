@@ -1396,58 +1396,138 @@ elif page == "Fiches Techniques":
                 st.dataframe(df_ing_cons, use_container_width=True, hide_index=True)
 
     # ══════════════════════════════════════════════════════
-    # ONGLET 3 : AJOUTER UNE RECETTE
+    # ONGLET 3 : AJOUTER / MODIFIER UNE RECETTE
     # ══════════════════════════════════════════════════════
     with tab_ajout:
-        st.subheader("Ajouter une nouvelle recette")
-        with st.form("form_recette"):
+        # ── Sélection recette à éditer (hors form → déclenche rerun) ──
+        noms_edit = ["— Nouvelle recette —"] + [r["nom"] for r in recettes_list]
+        choix_edit = st.selectbox("Créer ou modifier :", noms_edit, key="choix_edit")
+        rec_edit = next((r for r in recettes_list if r["nom"] == choix_edit), None)
+
+        # ── Mode de saisie (hors form → déclenche rerun) ──
+        mode_saisie = st.radio(
+            "Mode de saisie des poids :",
+            ["Brut + Perte% → Net calculé", "Net + Perte% → Brut calculé"],
+            horizontal=True, key="mode_saisie",
+            help="Brut→Net : tu saisies ce que tu achètes  |  Net→Brut : tu saisies ce que tu utilises en recette"
+        )
+        net_vers_brut = (mode_saisie == "Net + Perte% → Brut calculé")
+        if net_vers_brut:
+            st.caption("**Formule :** Brut = Net ÷ (1 - Perte%/100)  |  Coût = Brut × Prix/kg")
+        else:
+            st.caption("**Formule :** Net = Brut × (1 - Perte%/100)  |  Coût = Brut × Prix/kg")
+
+        # Clé dynamique : change quand on change de recette → réinitialise les champs
+        form_key_suffix = choix_edit.replace(" ", "_").replace("—", "new")
+
+        with st.form(f"form_recette_{form_key_suffix}"):
             c1, c2, c3 = st.columns(3)
             with c1:
-                f_nom = st.text_input("Nom de la recette")
+                f_nom = st.text_input("Nom de la recette",
+                    value=rec_edit["nom"] if rec_edit else "")
             with c2:
-                f_cat = st.selectbox("Catégorie", ["Chaud", "Légumerie", "Sushi", "Mix", "Mélange", "Désinfection", "Autre"])
+                cats = ["Chaud", "Légumerie", "Sushi", "Mix", "Mélange", "Désinfection", "Autre"]
+                cat_default = cats.index(rec_edit["categorie"]) if rec_edit and rec_edit.get("categorie") in cats else 0
+                f_cat = st.selectbox("Catégorie", cats, index=cat_default)
             with c3:
-                f_couverts = st.number_input("Nombre de couverts", min_value=1, value=6, step=1)
+                f_couverts = st.number_input("Nb couverts", min_value=1,
+                    value=int(rec_edit["nb_couverts"]) if rec_edit else 6, step=1)
 
-            st.markdown("**Ingrédients** — saisir le poids **brut** acheté + taux de perte")
-            st.caption("Coût = poids brut × prix/kg  |  Net final = brut × (1 - perte%/100)")
+            st.divider()
 
-            # En-têtes colonnes
-            hc1, hc2, hc3, hc4 = st.columns([3, 1.5, 1.5, 1.5])
-            hc1.markdown("**Ingrédient**")
-            hc2.markdown("**Brut (kg)**")
-            hc3.markdown("**Perte (%)**")
-            hc4.markdown("**Prix/kg (€)**")
+            # En-têtes
+            if net_vers_brut:
+                hc1, hc2, hc3, hc4, hc5 = st.columns([3, 1.5, 1.5, 1.8, 1.5])
+                hc1.markdown("**Ingrédient**")
+                hc2.markdown("**Net (kg)**")
+                hc3.markdown("**Perte (%)**")
+                hc4.markdown("**→ Brut (kg)**")
+                hc5.markdown("**Prix/kg (€)**")
+            else:
+                hc1, hc2, hc3, hc4, hc5 = st.columns([3, 1.5, 1.5, 1.8, 1.5])
+                hc1.markdown("**Ingrédient**")
+                hc2.markdown("**Brut (kg)**")
+                hc3.markdown("**Perte (%)**")
+                hc4.markdown("**→ Net (kg)**")
+                hc5.markdown("**Prix/kg (€)**")
 
             ing_rows = []
+            ing_existants = rec_edit["ingredients"] if rec_edit else []
             for i in range(10):
-                ca, cb, cc, cd = st.columns([3, 1.5, 1.5, 1.5])
-                with ca: nom_i   = st.text_input(f"ing_{i}", key=f"ing_nom_{i}",  label_visibility="collapsed")
-                with cb: brut_i  = st.number_input("b", key=f"ing_brut_{i}",  min_value=0.0, step=0.01,  format="%.3f", label_visibility="collapsed")
-                with cc: perte_i = st.number_input("p", key=f"ing_perte_{i}", min_value=0.0, max_value=100.0, step=0.5, format="%.1f", label_visibility="collapsed")
-                with cd: prix_i  = st.number_input("px", key=f"ing_prix_{i}",  min_value=0.0, step=0.1,  format="%.2f", label_visibility="collapsed")
+                ex = ing_existants[i] if i < len(ing_existants) else {}
+                ex_brut  = float(ex.get("poids_brut_kg", 0))
+                ex_perte = float(ex.get("taux_perte_pct",
+                    round((ex_brut - float(ex.get("poids_net_kg", ex_brut))) / ex_brut * 100, 1)
+                    if ex_brut > 0 and "poids_net_kg" in ex else 0))
+                ex_net   = round(ex_brut * (1 - ex_perte / 100), 4) if ex_brut > 0 else 0.0
+                ex_prix  = float(ex.get("prix_unitaire", 0))
+
+                ca, cb, cc, cd, ce = st.columns([3, 1.5, 1.5, 1.8, 1.5])
+                with ca:
+                    nom_i = st.text_input("nom", value=ex.get("nom", ""),
+                        key=f"r_nom_{i}_{form_key_suffix}", label_visibility="collapsed")
+                with cb:
+                    if net_vers_brut:
+                        val_b = st.number_input("net", value=ex_net,
+                            min_value=0.0, step=0.001, format="%.3f",
+                            key=f"r_b_{i}_{form_key_suffix}", label_visibility="collapsed")
+                    else:
+                        val_b = st.number_input("brut", value=ex_brut,
+                            min_value=0.0, step=0.001, format="%.3f",
+                            key=f"r_b_{i}_{form_key_suffix}", label_visibility="collapsed")
+                with cc:
+                    perte_i = st.number_input("perte", value=ex_perte,
+                        min_value=0.0, max_value=99.9, step=0.5, format="%.1f",
+                        key=f"r_p_{i}_{form_key_suffix}", label_visibility="collapsed")
+                with ce:
+                    prix_i = st.number_input("prix", value=ex_prix,
+                        min_value=0.0, step=0.1, format="%.2f",
+                        key=f"r_px_{i}_{form_key_suffix}", label_visibility="collapsed")
+
+                # Calcul brut/net selon mode
+                if net_vers_brut:
+                    diviseur = (1 - perte_i / 100)
+                    brut_final = round(val_b / diviseur, 4) if diviseur > 0 else val_b
+                    net_final  = val_b
+                else:
+                    brut_final = val_b
+                    net_final  = round(val_b * (1 - perte_i / 100), 4)
+
+                with cd:
+                    if net_vers_brut:
+                        st.text_input("brut_calc", value=f"{brut_final:.3f} kg",
+                            key=f"r_calc_{i}_{form_key_suffix}",
+                            label_visibility="collapsed", disabled=True)
+                    else:
+                        st.text_input("net_calc", value=f"{net_final:.3f} kg",
+                            key=f"r_calc_{i}_{form_key_suffix}",
+                            label_visibility="collapsed", disabled=True)
+
                 if nom_i.strip():
-                    net_calc = round(brut_i * (1 - perte_i / 100), 4)
                     ing_rows.append({
                         "nom": nom_i.strip(),
-                        "poids_brut_kg": brut_i,
+                        "poids_brut_kg": brut_final,
                         "taux_perte_pct": perte_i,
                         "prix_unitaire": prix_i,
                     })
 
-            submitted_rec = st.form_submit_button("Enregistrer la recette", type="primary")
+            st.divider()
+            btn_label = "💾 Modifier la recette" if rec_edit else "➕ Enregistrer la recette"
+            submitted_rec = st.form_submit_button(btn_label, type="primary")
             if submitted_rec:
                 if not f_nom.strip():
-                    st.error("Le nom de la recette est obligatoire.")
+                    st.error("Le nom est obligatoire.")
                 elif not ing_rows:
                     st.error("Ajoutez au moins un ingrédient.")
                 else:
-                    rec_id = str(uuid.uuid4())
-                    _db.collection(COLLECTION_RECETTES).document(rec_id).set({
+                    doc_id = rec_edit["id"] if rec_edit else str(uuid.uuid4())
+                    _db.collection(COLLECTION_RECETTES).document(doc_id).set({
                         "nom": f_nom.strip(), "categorie": f_cat,
                         "nb_couverts": int(f_couverts),
                         "ingredients": ing_rows,
-                        "created_at": str(date.today())
+                        "updated_at": str(date.today()),
+                        **({"created_at": rec_edit.get("created_at", str(date.today()))} if rec_edit
+                           else {"created_at": str(date.today())})
                     })
                     for ing in ing_rows:
                         ing_id = ing["nom"].lower().replace(" ", "_").replace("'", "")
@@ -1456,7 +1536,8 @@ elif page == "Fiches Techniques":
                             "unite": "kg", "fournisseur": "", "updated_at": str(date.today())
                         }, merge=True)
                     st.cache_data.clear()
-                    st.success(f"Recette '{f_nom}' enregistrée !")
+                    action = "modifiée" if rec_edit else "enregistrée"
+                    st.success(f"Recette '{f_nom}' {action} !")
                     st.rerun()
 
 # ─────────────────────────────────────────────────────────
