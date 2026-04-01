@@ -19,6 +19,7 @@ FIRESTORE_COLLECTION = "kpi_2026"
 COLLECTION_RECETTES   = "recettes"
 COLLECTION_INGREDIENTS = "ingredients"
 COLLECTION_FACTURES   = "factures"
+COLLECTION_VENTES     = "ventes"
 
 def _get_firestore_client():
     """
@@ -196,6 +197,20 @@ def load_factures():
     docs = _db.collection(COLLECTION_FACTURES).stream()
     return sorted([{"id": d.id, **d.to_dict()} for d in docs],
                   key=lambda x: x.get("date", ""), reverse=True)
+
+@st.cache_data(ttl=60)
+def load_ventes():
+    docs = _db.collection(COLLECTION_VENTES).stream()
+    return sorted([{"id": d.id, **d.to_dict()} for d in docs],
+                  key=lambda x: x.get("date", ""), reverse=True)
+
+def _get_semaine_iso(date_str):
+    """Retourne le numéro de semaine ISO pour une date YYYY-MM-DD."""
+    try:
+        from datetime import datetime
+        return datetime.strptime(date_str, "%Y-%m-%d").isocalendar()[1]
+    except Exception:
+        return None
 
 def _calcul_fiche(recette, prix_dict):
     """Calcule les coûts d'une recette.
@@ -550,6 +565,27 @@ Règles impératives :
         return {"error": str(e)}
 
 
+def _extract_facture_vision(image_bytes: bytes, media_type: str = "image/jpeg") -> dict:
+    """Utilise Google Cloud Vision (gratuit 1000 req/mois) pour extraire le texte d'une facture."""
+    try:
+        from google.cloud import vision as gvision
+    except ImportError:
+        return {"error": "Package 'google-cloud-vision' non installé. Ajoutez-le dans requirements.txt."}
+    try:
+        creds = _get_gcp_credentials()
+        vision_client = gvision.ImageAnnotatorClient(credentials=creds)
+        image = gvision.Image(content=image_bytes)
+        response = vision_client.document_text_detection(image=image)
+        if response.error.message:
+            return {"error": f"Vision API : {response.error.message}"}
+        full_text = response.full_text_annotation.text
+        if not full_text:
+            return {"error": "Aucun texte détecté dans l'image."}
+        return _parse_facture_text(full_text)
+    except Exception as e:
+        return {"error": str(e)}
+
+
 # --- CHARGEMENT DES DONNÉES ---
 try:
     data = load_data()
@@ -581,7 +617,8 @@ POSTES_EMOJIS = {
     "CF tampon": "❄️ CF tampon",
     "Fiches Techniques": "📖 Fiches Techniques",
     "Factures": "🧾 Factures",
-    "Saisie de données": "✏️ Saisie de données"
+    "Saisie de données": "✏️ Saisie de données",
+    "Ventes & CA": "💰 Ventes & CA"
 }
 
 OBJECTIF_EURO_KG = 0.70
@@ -1299,7 +1336,7 @@ elif page == "Fiches Techniques":
     recettes_list = load_recettes()
     prix_dict     = load_ingredients()
 
-    tab_fiche, tab_prod, tab_ajout = st.tabs(["📋 Fiche Recette", "🏭 Plan de Production", "➕ Ajouter une recette"])
+    tab_fiche, tab_prod, tab_ajout, tab_catalogue = st.tabs(["📋 Fiche Recette", "🏭 Plan de Production", "➕ Ajouter une recette", "🧂 Catalogue ingrédients"])
 
     # ══════════════════════════════════════════════════════
     # ONGLET 1 : FICHE RECETTE
@@ -1458,14 +1495,17 @@ elif page == "Fiches Techniques":
                     pv = float(rec_r.get("prix_vente_couvert", 0))
                     ca_r = round(pv * nb_prod, 2) if pv > 0 else 0.0
                     marge_r = round(ca_r - cout_total_r, 2) if pv > 0 else 0.0
+                    marge_pct_r = round(marge_r / ca_r * 100, 1) if ca_r > 0 else None
 
                     plan_rows.append({
                         "Recette": nom_r,
                         "Couverts": nb_prod,
                         "Coût/couvert (€)": round(cout_cov, 2),
+                        "Prix vente/couvert (€)": round(pv, 2) if pv > 0 else "—",
                         "Coût total (€)": cout_total_r,
                         "CA prévu (€)": ca_r if pv > 0 else "—",
                         "Marge (€)": marge_r if pv > 0 else "—",
+                        "Marge (%)": f"{marge_pct_r:.1f}%" if marge_pct_r is not None else "—",
                     })
 
                     # Consolidation ingrédients
@@ -1567,6 +1607,7 @@ elif page == "Fiches Techniques":
 
             ing_rows = []
             ing_existants = rec_edit["ingredients"] if rec_edit else []
+            cat_names_form = sorted(prix_dict.keys())
             for i in range(10):
                 ex = ing_existants[i] if i < len(ing_existants) else {}
                 ex_brut  = float(ex.get("poids_brut_kg", 0))
@@ -1575,11 +1616,29 @@ elif page == "Fiches Techniques":
                     if ex_brut > 0 and "poids_net_kg" in ex else 0))
                 ex_net   = round(ex_brut * (1 - ex_perte / 100), 4) if ex_brut > 0 else 0.0
                 ex_prix  = float(ex.get("prix_unitaire", 0))
+                current_nom = ex.get("nom", "")
+                # Auto-fill price from catalog when price not set in recipe
+                if ex_prix == 0 and current_nom and current_nom in prix_dict:
+                    ex_prix = float(prix_dict[current_nom].get("prix_unitaire", 0))
 
                 ca, cb, cc, cd, ce = st.columns([3, 1.5, 1.5, 1.8, 1.5])
                 with ca:
-                    nom_i = st.text_input("nom", value=ex.get("nom", ""),
-                        key=f"r_nom_{i}_{form_key_suffix}", label_visibility="collapsed")
+                    ing_options = cat_names_form + ["— Saisie manuelle —"]
+                    if current_nom in cat_names_form:
+                        def_idx = cat_names_form.index(current_nom)
+                    else:
+                        def_idx = len(ing_options) - 1
+                    sel_i = st.selectbox("nom", options=ing_options, index=def_idx,
+                        key=f"r_sel_{i}_{form_key_suffix}", label_visibility="collapsed")
+                    if sel_i == "— Saisie manuelle —":
+                        nom_i = st.text_input("nom_libre", value=current_nom if current_nom not in cat_names_form else "",
+                            key=f"r_nom_{i}_{form_key_suffix}", label_visibility="collapsed",
+                            placeholder="Nom de l'ingrédient")
+                    else:
+                        nom_i = sel_i
+                        # Pre-fill price from catalog for catalog selection if price not already set
+                        if ex_prix == 0 and nom_i in prix_dict:
+                            ex_prix = float(prix_dict[nom_i].get("prix_unitaire", 0))
                 with cb:
                     if net_vers_brut:
                         val_b = st.number_input("net", value=ex_net,
@@ -1654,6 +1713,86 @@ elif page == "Fiches Techniques":
                     st.success(f"Recette '{f_nom}' {action} !")
                     st.rerun()
 
+    # ══════════════════════════════════════════════════════
+    # ONGLET 4 : CATALOGUE INGRÉDIENTS
+    # ══════════════════════════════════════════════════════
+    with tab_catalogue:
+        st.subheader("🧂 Catalogue des ingrédients")
+
+        # ── Tableau de tous les ingrédients ──
+        if prix_dict:
+            ing_cat_data = [
+                {
+                    "Ingrédient": nom,
+                    "Prix/unité (€)": float(info.get("prix_unitaire", 0)),
+                    "Unité": info.get("unite", "kg"),
+                    "Fournisseur": info.get("fournisseur", ""),
+                }
+                for nom, info in sorted(prix_dict.items())
+            ]
+            st.dataframe(pd.DataFrame(ing_cat_data), use_container_width=True, hide_index=True)
+        else:
+            st.info("Aucun ingrédient dans le catalogue. Ajoutez-en ci-dessous.")
+
+        st.divider()
+
+        # ── Ajouter / Modifier ──
+        st.markdown("#### Ajouter / Modifier un ingrédient")
+        cat_edit_names = sorted(prix_dict.keys())
+        cat_edit_options = ["— Nouvel ingrédient —"] + cat_edit_names
+        cat_edit_sel = st.selectbox("Créer ou modifier :", cat_edit_options, key="cat_edit_sel")
+
+        if cat_edit_sel == "— Nouvel ingrédient —":
+            cat_existing = {}
+            nom_default = ""
+        else:
+            cat_existing = prix_dict.get(cat_edit_sel, {})
+            nom_default = cat_edit_sel
+
+        unite_opts = ["kg", "L", "pièce", "colis", "boîte"]
+        cur_unite = cat_existing.get("unite", "kg")
+
+        with st.form("form_catalogue_add"):
+            f_nom_c = st.text_input("Nom de l'ingrédient *", value=nom_default)
+            col_ca, col_cb, col_cc = st.columns(3)
+            with col_ca:
+                f_prix_c = st.number_input("Prix (€/unité)", min_value=0.0,
+                    value=float(cat_existing.get("prix_unitaire", 0.0)), step=0.01, format="%.2f")
+            with col_cb:
+                f_unite_c = st.selectbox("Unité",
+                    unite_opts, index=unite_opts.index(cur_unite) if cur_unite in unite_opts else 0)
+            with col_cc:
+                f_fourn_c = st.text_input("Fournisseur", value=cat_existing.get("fournisseur", ""))
+
+            if st.form_submit_button("💾 Enregistrer", type="primary"):
+                if not f_nom_c.strip():
+                    st.error("Le nom est obligatoire.")
+                else:
+                    ing_id_c = f_nom_c.strip().lower().replace(" ", "_").replace("'", "")
+                    _db.collection(COLLECTION_INGREDIENTS).document(ing_id_c).set({
+                        "nom": f_nom_c.strip(),
+                        "prix_unitaire": f_prix_c,
+                        "unite": f_unite_c,
+                        "fournisseur": f_fourn_c,
+                        "updated_at": str(date.today()),
+                    }, merge=True)
+                    st.cache_data.clear()
+                    st.success(f"✅ '{f_nom_c.strip()}' enregistré dans le catalogue.")
+                    st.rerun()
+
+        # ── Supprimer ──
+        if cat_edit_names:
+            st.divider()
+            st.markdown("#### Supprimer un ingrédient")
+            with st.form("form_catalogue_del"):
+                del_sel = st.selectbox("Ingrédient à supprimer :", cat_edit_names, key="del_sel_cat")
+                if st.form_submit_button("🗑️ Supprimer", type="secondary"):
+                    del_id = prix_dict.get(del_sel, {}).get("id", del_sel.lower().replace(" ", "_").replace("'", ""))
+                    _db.collection(COLLECTION_INGREDIENTS).document(del_id).delete()
+                    st.cache_data.clear()
+                    st.warning(f"'{del_sel}' supprimé du catalogue.")
+                    st.rerun()
+
 # ─────────────────────────────────────────────────────────
 # PAGE : FACTURES
 # ─────────────────────────────────────────────────────────
@@ -1663,8 +1802,8 @@ elif page == "Factures":
     factures_list = load_factures()
     prix_dict     = load_ingredients()
 
-    # ── Onglets Scanner / Manuel / Liste ──────────────────
-    tab_scan, tab_manuel, tab_liste = st.tabs(["📸 Scanner une facture", "✏️ Saisie manuelle", "📋 Liste des factures"])
+    # ── Onglets Liste / Scanner / Manuel ──────────────────
+    tab_liste, tab_scan, tab_manuel = st.tabs(["📋 Toutes les factures", "📸 Scanner une facture", "✏️ Saisie manuelle"])
 
     with tab_scan:
         st.subheader("Extraction automatique par photo")
@@ -1679,7 +1818,7 @@ elif page == "Factures":
                 media_type = "image/jpeg"
                 if img_src.name.endswith(".png") if hasattr(img_src, "name") else False:
                     media_type = "image/png"
-                result = _extract_facture_claude(img_src.getvalue(), media_type)
+                result = _extract_facture_vision(img_src.getvalue(), media_type)
 
             if "error" in result:
                 st.error(f"Erreur : {result['error']}")
@@ -1806,43 +1945,464 @@ elif page == "Factures":
                     st.rerun()
 
     with tab_liste:
-        st.subheader("Historique des factures")
+        st.subheader("Toutes les factures")
         if not factures_list:
-            st.info("Aucune facture enregistrée.")
+            st.info("Aucune facture enregistrée. Scannez ou saisissez une facture.")
         else:
-            # Tableau récapitulatif
+            # ── Filtres ────────────────────────────────────────
+            all_fournisseurs = sorted(set(f.get("fournisseur", "") for f in factures_list if f.get("fournisseur")))
+            fl1, fl2, fl3 = st.columns([2, 1, 1])
+            with fl1:
+                filtre_fourn = st.multiselect("Fournisseur(s)", all_fournisseurs, placeholder="Tous")
+            with fl2:
+                filtre_date_debut = st.text_input("Date début (YYYY-MM-DD)", placeholder="ex: 2025-01-01")
+            with fl3:
+                filtre_date_fin = st.text_input("Date fin (YYYY-MM-DD)", placeholder="ex: 2025-12-31")
+
+            # Appliquer filtres
+            fac_filtrées = factures_list
+            if filtre_fourn:
+                fac_filtrées = [f for f in fac_filtrées if f.get("fournisseur","") in filtre_fourn]
+            if filtre_date_debut:
+                fac_filtrées = [f for f in fac_filtrées if f.get("date","") >= filtre_date_debut]
+            if filtre_date_fin:
+                fac_filtrées = [f for f in fac_filtrées if f.get("date","") <= filtre_date_fin]
+
+            # ── KPIs ───────────────────────────────────────────
+            total_ht_all  = sum(f.get("total_ht", 0)  for f in fac_filtrées)
+            total_ttc_all = sum(f.get("total_ttc", 0) for f in fac_filtrées)
+            nb_fourn = len(set(f.get("fournisseur","") for f in fac_filtrées))
+            fk1, fk2, fk3, fk4 = st.columns(4)
+            fk1.metric("Factures", len(fac_filtrées))
+            fk2.metric("Total achats HT", f"{total_ht_all:.2f} €")
+            fk3.metric("Total achats TTC", f"{total_ttc_all:.2f} €")
+            fk4.metric("Fournisseurs", nb_fourn)
+
+            st.divider()
+
+            # ── Tableau récapitulatif ──────────────────────────
             df_fac = pd.DataFrame([{
                 "Date": f.get("date", ""),
                 "Fournisseur": f.get("fournisseur", ""),
                 "N° Facture": f.get("numero", ""),
-                "Total HT (€)": f.get("total_ht", 0),
-                "TVA (€)": f.get("tva", 0),
-                "Total TTC (€)": f.get("total_ttc", 0),
-                "Statut": f.get("statut", ""),
-            } for f in factures_list])
-            st.dataframe(df_fac, use_container_width=True, hide_index=True,
+                "Total HT (€)": float(f.get("total_ht", 0)),
+                "TVA (€)": float(f.get("tva", 0)),
+                "Total TTC (€)": float(f.get("total_ttc", 0)),
+                "Statut": f.get("statut", "validée"),
+                "Saisie le": f.get("created_at", ""),
+                "_id": f.get("id", ""),
+            } for f in fac_filtrées])
+
+            st.dataframe(
+                df_fac.drop(columns=["_id"]),
+                use_container_width=True,
+                hide_index=True,
                 column_config={
                     "Total HT (€)":  st.column_config.NumberColumn(format="%.2f €"),
                     "TVA (€)":       st.column_config.NumberColumn(format="%.2f €"),
                     "Total TTC (€)": st.column_config.NumberColumn(format="%.2f €"),
+                }
+            )
+
+            # ── Par fournisseur ────────────────────────────────
+            if len(all_fournisseurs) > 1:
+                st.divider()
+                st.markdown("**Achats par fournisseur**")
+                df_fourn = df_fac.groupby("Fournisseur")["Total HT (€)"].sum().reset_index()
+                df_fourn = df_fourn.sort_values("Total HT (€)", ascending=False)
+                df_fourn["Total HT (€)"] = df_fourn["Total HT (€)"].round(2)
+                st.dataframe(df_fourn, use_container_width=True, hide_index=True,
+                    column_config={"Total HT (€)": st.column_config.NumberColumn(format="%.2f €")})
+
+            # ── Détail + suppression ───────────────────────────
+            st.divider()
+            labels_fac = [
+                f"{f.get('date','')} — {f.get('fournisseur','')} — {f.get('numero','') or 'sans n°'}"
+                for f in fac_filtrées
+            ]
+            if labels_fac:
+                choix_fac = st.selectbox("Détail d'une facture :", labels_fac, key="detail_fac_select")
+                idx = labels_fac.index(choix_fac)
+                fac_detail = fac_filtrées[idx]
+
+                dc1, dc2, dc3, dc4 = st.columns(4)
+                dc1.markdown(f"**Fournisseur :** {fac_detail.get('fournisseur','')}")
+                dc2.markdown(f"**Date :** {fac_detail.get('date','')}")
+                dc3.markdown(f"**N° :** {fac_detail.get('numero','—')}")
+                dc4.markdown(f"**TTC :** {float(fac_detail.get('total_ttc',0)):.2f} €")
+
+                lignes_detail = fac_detail.get("lignes", [])
+                if lignes_detail:
+                    df_lig = pd.DataFrame(lignes_detail)
+                    # Renommage colonnes si présentes
+                    rename_map = {"article": "Article", "quantite": "Qté", "unite": "Unité",
+                                  "prix_unitaire": "PU (€)", "total_ht": "Total HT (€)", "reference": "Réf"}
+                    df_lig = df_lig.rename(columns={k: v for k, v in rename_map.items() if k in df_lig.columns})
+                    col_cfg = {}
+                    if "PU (€)" in df_lig.columns:
+                        col_cfg["PU (€)"] = st.column_config.NumberColumn(format="%.3f €")
+                    if "Total HT (€)" in df_lig.columns:
+                        col_cfg["Total HT (€)"] = st.column_config.NumberColumn(format="%.2f €")
+                    st.dataframe(df_lig, use_container_width=True, hide_index=True, column_config=col_cfg)
+                else:
+                    st.caption("Aucune ligne de détail enregistrée pour cette facture.")
+
+                # Bouton de suppression
+                fac_id = fac_detail.get("id", "")
+                if fac_id:
+                    with st.expander("⚠️ Supprimer cette facture"):
+                        st.warning(f"Supprimer définitivement la facture {fac_detail.get('numero','sans n°')} de {fac_detail.get('fournisseur','')} ?")
+                        if st.button("🗑️ Confirmer la suppression", type="primary", key="del_fac_btn"):
+                            _db.collection(COLLECTION_FACTURES).document(fac_id).delete()
+                            st.cache_data.clear()
+                            st.success("Facture supprimée.")
+                            st.rerun()
+
+# ── PAGE : VENTES & CA ──────────────────────────────────────────────────────
+elif page == "Ventes & CA":
+    st.title("💰 Ventes & Chiffre d'Affaires")
+
+    tab_saisie, tab_dashboard = st.tabs(["📝 Saisie du CA", "📊 Dashboard Croisé"])
+
+    # ── Onglet 1 : Saisie ───────────────────────────────────────────────────
+    with tab_saisie:
+        st.markdown("### Saisir le CA du jour")
+
+        recettes_list = load_recettes()
+        noms_recettes = sorted([r["nom"] for r in recettes_list]) if recettes_list else []
+
+        with st.form("form_saisie_ca", clear_on_submit=True):
+            col_d1, col_d2, col_d3 = st.columns([2, 1, 1])
+            with col_d1:
+                date_vente = st.date_input("Date", value=date.today())
+            with col_d2:
+                canal = st.selectbox("Canal", ["Livraison", "Sur place", "Click & Collect", "Mixte"])
+            with col_d3:
+                nb_commandes_v = st.number_input("Nb commandes", min_value=0, step=1)
+
+            st.divider()
+            col_ca1, col_ca2, col_ca3 = st.columns(3)
+            with col_ca1:
+                ca_ht = st.number_input("CA HT (€)", min_value=0.0, step=10.0, format="%.2f")
+            with col_ca2:
+                taux_tva = st.number_input("TVA (%)", min_value=0.0, max_value=25.0, value=5.5, step=0.5)
+            with col_ca3:
+                nb_couverts_v = st.number_input("Nb couverts", min_value=0, step=1)
+            ca_ttc = ca_ht * (1 + taux_tva / 100)
+            if ca_ht > 0:
+                st.caption(f"CA TTC calculé : **{ca_ttc:,.2f} €**")
+
+            st.divider()
+            st.markdown("#### Détail des ventes par recette *(optionnel)*")
+            st.caption("Renseignez les plats vendus pour enrichir l'analyse par recette.")
+
+            lignes_vente = []
+            nb_lignes = st.number_input("Nombre de lignes", min_value=1, max_value=20, value=3, step=1)
+            for i in range(int(nb_lignes)):
+                lc1, lc2, lc3 = st.columns([3, 1, 1])
+                with lc1:
+                    recette_sel = st.selectbox(
+                        f"Recette {i+1}",
+                        ["— sélectionner —"] + noms_recettes,
+                        key=f"lig_rec_{i}"
+                    )
+                with lc2:
+                    qty = st.number_input("Qté (couverts)", min_value=0, step=1, key=f"lig_qty_{i}")
+                with lc3:
+                    prix_v = st.number_input("Prix vente/couvert (€)", min_value=0.0, step=0.10,
+                                             format="%.2f", key=f"lig_prix_{i}")
+                if recette_sel != "— sélectionner —" and qty > 0:
+                    recette_obj = next((r for r in recettes_list if r["nom"] == recette_sel), {})
+                    lignes_vente.append({
+                        "recette_nom": recette_sel,
+                        "categorie": recette_obj.get("categorie", ""),
+                        "quantite": int(qty),
+                        "prix_vente_couvert": float(prix_v),
+                        "ca_ligne": round(float(qty) * float(prix_v), 2)
+                    })
+
+            notes = st.text_area("Notes", placeholder="Événements, commentaires...")
+
+            submitted = st.form_submit_button("💾 Enregistrer", type="primary")
+            if submitted:
+                if ca_ht <= 0:
+                    st.error("Veuillez saisir un CA HT supérieur à 0.")
+                else:
+                    doc = {
+                        "date": str(date_vente),
+                        "semaine": int(date_vente.isocalendar()[1]),
+                        "annee": int(date_vente.year),
+                        "canal": canal,
+                        "ca_ht": round(float(ca_ht), 2),
+                        "tva": round(float(ca_ht * taux_tva / 100), 2),
+                        "ca_ttc": round(float(ca_ttc), 2),
+                        "nb_couverts": int(nb_couverts_v),
+                        "nb_commandes": int(nb_commandes_v),
+                        "lignes": lignes_vente,
+                        "notes": notes,
+                        "created_at": str(date.today())
+                    }
+                    _db.collection(COLLECTION_VENTES).document(str(uuid.uuid4())).set(doc)
+                    st.cache_data.clear()
+                    st.success(f"CA du {date_vente} enregistré : **{ca_ht:,.2f} € HT**")
+
+        # ── Historique rapide ────────────────────────────────────────────────
+        ventes_list = load_ventes()
+        if ventes_list:
+            st.divider()
+            st.markdown("#### Dernières saisies")
+            df_hist = pd.DataFrame([{
+                "Date": v.get("date", ""),
+                "Canal": v.get("canal", ""),
+                "CA HT (€)": v.get("ca_ht", 0),
+                "CA TTC (€)": v.get("ca_ttc", 0),
+                "Couverts": v.get("nb_couverts", 0),
+                "Commandes": v.get("nb_commandes", 0),
+            } for v in ventes_list[:15]])
+            st.dataframe(df_hist, use_container_width=True, hide_index=True,
+                column_config={
+                    "CA HT (€)":  st.column_config.NumberColumn(format="%.2f €"),
+                    "CA TTC (€)": st.column_config.NumberColumn(format="%.2f €"),
                 })
 
-            # KPIs achats
-            st.divider()
-            total_ht_all  = sum(f.get("total_ht", 0)  for f in factures_list)
-            total_ttc_all = sum(f.get("total_ttc", 0) for f in factures_list)
-            nb_fourn = len(set(f.get("fournisseur","") for f in factures_list))
-            fk1, fk2, fk3 = st.columns(3)
-            fk1.metric("Total achats HT", f"{total_ht_all:.2f} €")
-            fk2.metric("Total achats TTC", f"{total_ttc_all:.2f} €")
-            fk3.metric("Fournisseurs distincts", nb_fourn)
+            # Suppression
+            with st.expander("⚠️ Supprimer une saisie"):
+                labels_v = [f"{v.get('date','')} — {v.get('ca_ht',0):,.2f} € HT" for v in ventes_list]
+                sel_v = st.selectbox("Choisir la saisie à supprimer", labels_v, key="del_vente_sel")
+                if st.button("🗑️ Supprimer", key="del_vente_btn"):
+                    idx_v = labels_v.index(sel_v)
+                    _db.collection(COLLECTION_VENTES).document(ventes_list[idx_v]["id"]).delete()
+                    st.cache_data.clear()
+                    st.success("Saisie supprimée.")
+                    st.rerun()
 
-            # Détail facture sélectionnée
+    # ── Onglet 2 : Dashboard Croisé ──────────────────────────────────────────
+    with tab_dashboard:
+        ventes_list = load_ventes()
+        factures_list = load_factures()
+
+        if not ventes_list:
+            st.info("Aucune donnée de vente enregistrée. Commencez par saisir le CA dans l'onglet **Saisie du CA**.")
+        else:
+            df_v = pd.DataFrame(ventes_list)
+            df_v["ca_ht"] = pd.to_numeric(df_v.get("ca_ht", 0), errors="coerce").fillna(0)
+            df_v["ca_ttc"] = pd.to_numeric(df_v.get("ca_ttc", 0), errors="coerce").fillna(0)
+            df_v["nb_couverts"] = pd.to_numeric(df_v.get("nb_couverts", 0), errors="coerce").fillna(0)
+            df_v["nb_commandes"] = pd.to_numeric(df_v.get("nb_commandes", 0), errors="coerce").fillna(0)
+            if "semaine" not in df_v.columns:
+                df_v["semaine"] = df_v["date"].apply(_get_semaine_iso)
+            df_v["semaine"] = pd.to_numeric(df_v["semaine"], errors="coerce").fillna(0).astype(int)
+
+            # ── Sélecteur de période ────────────────────────────────────────
+            toutes_semaines = sorted(df_v["semaine"].unique(), reverse=True)
+            sem_options = ["Toutes"] + [f"Semaine {s}" for s in toutes_semaines]
+            filtre_sem = st.selectbox("Filtrer par semaine", sem_options, key="dash_vente_sem")
+            if filtre_sem != "Toutes":
+                sem_val = int(filtre_sem.replace("Semaine ", ""))
+                df_filtre = df_v[df_v["semaine"] == sem_val]
+            else:
+                df_filtre = df_v
+
+            # ── Coûts achats depuis factures ────────────────────────────────
+            factures_par_sem: dict = {}
+            for f in factures_list:
+                s = _get_semaine_iso(f.get("date", ""))
+                if s:
+                    factures_par_sem[s] = factures_par_sem.get(s, 0.0) + float(f.get("total_ht", 0))
+            cout_achats_total = sum(
+                factures_par_sem.get(s, 0)
+                for s in df_filtre["semaine"].unique()
+            )
+
+            # ── KPIs ────────────────────────────────────────────────────────
+            ca_total     = df_filtre["ca_ht"].sum()
+            nb_jours     = df_filtre["date"].nunique()
+            ca_moyen_j   = ca_total / nb_jours if nb_jours > 0 else 0
+            marge_brute  = ca_total - cout_achats_total
+            food_cost_pct = (cout_achats_total / ca_total * 100) if ca_total > 0 else 0
+            total_couverts = df_filtre["nb_couverts"].sum()
+            ca_par_couvert = ca_total / total_couverts if total_couverts > 0 else 0
+
+            kc1, kc2, kc3, kc4, kc5 = st.columns(5)
+            kc1.metric("CA HT total", f"{ca_total:,.0f} €")
+            kc2.metric("CA moyen / jour", f"{ca_moyen_j:,.0f} €")
+            kc3.metric("Marge brute", f"{marge_brute:,.0f} €",
+                       delta=f"{(marge_brute/ca_total*100):.1f} %" if ca_total > 0 else None)
+            kc4.metric("Food Cost %", f"{food_cost_pct:.1f} %",
+                       delta=f"cible < 30 %", delta_color="inverse")
+            kc5.metric("CA / couvert", f"{ca_par_couvert:.2f} €" if total_couverts > 0 else "—")
+
             st.divider()
-            choix_fac = st.selectbox("Voir le détail d'une facture :",
-                [f"{f.get('date','')} — {f.get('fournisseur','')} — {f.get('numero','')}" for f in factures_list])
-            idx = [f"{f.get('date','')} — {f.get('fournisseur','')} — {f.get('numero','')}" for f in factures_list].index(choix_fac)
-            fac_detail = factures_list[idx]
-            lignes_detail = fac_detail.get("lignes", [])
-            if lignes_detail:
-                st.dataframe(pd.DataFrame(lignes_detail), use_container_width=True, hide_index=True)
+
+            # ── Graphique 1 : CA vs Coûts achats par semaine ─────────────────
+            semaines_communes = sorted(
+                set(df_v["semaine"].unique()) | set(factures_par_sem.keys())
+            )
+            df_croise = pd.DataFrame({
+                "Semaine": semaines_communes,
+                "CA HT (€)": [df_v[df_v["semaine"]==s]["ca_ht"].sum() for s in semaines_communes],
+                "Coûts achats (€)": [factures_par_sem.get(s, 0) for s in semaines_communes],
+            })
+            df_croise["Marge brute (€)"] = df_croise["CA HT (€)"] - df_croise["Coûts achats (€)"]
+            df_croise["Semaine"] = df_croise["Semaine"].astype(str).apply(lambda x: f"S{x}")
+
+            col_g1, col_g2 = st.columns(2)
+            with col_g1:
+                st.markdown("##### CA vs Coûts achats par semaine")
+                fig1 = go.Figure()
+                fig1.add_trace(go.Bar(name="CA HT", x=df_croise["Semaine"],
+                                      y=df_croise["CA HT (€)"], marker_color="#2ecc71"))
+                fig1.add_trace(go.Bar(name="Coûts achats", x=df_croise["Semaine"],
+                                      y=df_croise["Coûts achats (€)"], marker_color="#e74c3c"))
+                fig1.add_trace(go.Scatter(name="Marge brute", x=df_croise["Semaine"],
+                                          y=df_croise["Marge brute (€)"],
+                                          mode="lines+markers", line=dict(color="#f39c12", width=2)))
+                fig1.update_layout(barmode="group", height=350, legend=dict(orientation="h"),
+                                   yaxis_ticksuffix=" €", xaxis_title="Semaine")
+                st.plotly_chart(fig1, use_container_width=True)
+
+            # ── Graphique 2 : Evolution CA journalier ────────────────────────
+            with col_g2:
+                st.markdown("##### Evolution du CA journalier")
+                df_daily = df_v.groupby("date")["ca_ht"].sum().reset_index().sort_values("date")
+                fig2 = px.area(df_daily, x="date", y="ca_ht",
+                               labels={"date": "Date", "ca_ht": "CA HT (€)"},
+                               color_discrete_sequence=["#3498db"])
+                fig2.update_layout(height=350, yaxis_ticksuffix=" €")
+                st.plotly_chart(fig2, use_container_width=True)
+
+            # ── Croisement production : CA / kg produit ──────────────────────
+            if not data.empty:
+                st.divider()
+                st.markdown("##### Croisement CA × Production — Valeur ajoutée / kg")
+                ca_par_sem_prod = df_v.groupby("semaine")["ca_ht"].sum().reset_index()
+                ca_par_sem_prod.columns = ["Semaine", "CA HT"]
+                prod_par_sem = data[["Semaine", "Kg produits global", "Commandes",
+                                     "Euro_kilo_global"]].copy()
+                prod_par_sem["Semaine"] = prod_par_sem["Semaine"].astype(int)
+                df_merge = pd.merge(ca_par_sem_prod, prod_par_sem, on="Semaine", how="inner")
+                df_merge["CA/kg produit (€)"] = (
+                    df_merge["CA HT"] / df_merge["Kg produits global"]
+                ).replace([float("inf"), float("-inf")], 0).fillna(0).round(3)
+                df_merge["CA/Commande (€)"] = (
+                    df_merge["CA HT"] / df_merge["Commandes"]
+                ).replace([float("inf"), float("-inf")], 0).fillna(0).round(2)
+
+                col_g3, col_g4 = st.columns(2)
+                with col_g3:
+                    fig3 = make_subplots(specs=[[{"secondary_y": True}]])
+                    sem_labels = df_merge["Semaine"].astype(str).apply(lambda x: f"S{x}")
+                    fig3.add_trace(go.Bar(name="CA HT", x=sem_labels,
+                                          y=df_merge["CA HT"], marker_color="#2ecc71"), secondary_y=False)
+                    fig3.add_trace(go.Scatter(name="CA/kg prod.", x=sem_labels,
+                                              y=df_merge["CA/kg produit (€)"],
+                                              mode="lines+markers",
+                                              line=dict(color="#9b59b6", width=2)), secondary_y=True)
+                    fig3.update_layout(height=320, title_text="CA HT vs CA/kg produit",
+                                       legend=dict(orientation="h"))
+                    fig3.update_yaxes(title_text="CA HT (€)", secondary_y=False)
+                    fig3.update_yaxes(title_text="€/kg", secondary_y=True)
+                    st.plotly_chart(fig3, use_container_width=True)
+
+                with col_g4:
+                    fig4 = make_subplots(specs=[[{"secondary_y": True}]])
+                    fig4.add_trace(go.Bar(name="CA HT", x=sem_labels,
+                                          y=df_merge["CA HT"], marker_color="#2ecc71"), secondary_y=False)
+                    fig4.add_trace(go.Scatter(name="CA/Commande", x=sem_labels,
+                                              y=df_merge["CA/Commande (€)"],
+                                              mode="lines+markers",
+                                              line=dict(color="#e67e22", width=2)), secondary_y=True)
+                    fig4.update_layout(height=320, title_text="CA HT vs CA / Commande",
+                                       legend=dict(orientation="h"))
+                    fig4.update_yaxes(title_text="CA HT (€)", secondary_y=False)
+                    fig4.update_yaxes(title_text="€/Commande", secondary_y=True)
+                    st.plotly_chart(fig4, use_container_width=True)
+
+                # Tableau récap croisé
+                st.markdown("**Tableau récapitulatif croisé**")
+                df_recap = df_merge[["Semaine", "CA HT", "Kg produits global",
+                                     "Commandes", "CA/kg produit (€)", "CA/Commande (€)",
+                                     "Euro_kilo_global"]].copy()
+                df_recap.columns = ["Semaine", "CA HT (€)", "Kg produits", "Commandes",
+                                    "CA/kg prod. (€)", "CA/Commande (€)", "Coût/kg (€)"]
+                st.dataframe(df_recap.sort_values("Semaine", ascending=False),
+                             use_container_width=True, hide_index=True,
+                             column_config={
+                                 "CA HT (€)": st.column_config.NumberColumn(format="%.2f €"),
+                                 "CA/kg prod. (€)": st.column_config.NumberColumn(format="%.3f €"),
+                                 "CA/Commande (€)": st.column_config.NumberColumn(format="%.2f €"),
+                                 "Coût/kg (€)": st.column_config.NumberColumn(format="%.3f €"),
+                             })
+
+            # ── Top recettes vendues ─────────────────────────────────────────
+            all_lignes = []
+            for v in ventes_list:
+                for lig in v.get("lignes", []):
+                    all_lignes.append({
+                        "recette": lig.get("recette_nom", ""),
+                        "categorie": lig.get("categorie", ""),
+                        "quantite": float(lig.get("quantite", 0)),
+                        "ca_ligne": float(lig.get("ca_ligne", 0)),
+                    })
+            if all_lignes:
+                st.divider()
+                st.markdown("##### Top recettes vendues")
+                df_rec = pd.DataFrame(all_lignes)
+                df_top = (df_rec.groupby("recette")
+                               .agg(couverts=("quantite", "sum"), ca=("ca_ligne", "sum"))
+                               .reset_index()
+                               .sort_values("ca", ascending=False)
+                               .head(10))
+                df_top["prix_moyen_couvert"] = (df_top["ca"] / df_top["couverts"]).round(2)
+
+                col_t1, col_t2 = st.columns(2)
+                with col_t1:
+                    fig5 = px.bar(df_top, x="ca", y="recette", orientation="h",
+                                  labels={"ca": "CA (€)", "recette": ""},
+                                  color="ca", color_continuous_scale="Greens")
+                    fig5.update_layout(height=350, title="Top 10 recettes par CA",
+                                       coloraxis_showscale=False)
+                    fig5.update_xaxes(ticksuffix=" €")
+                    st.plotly_chart(fig5, use_container_width=True)
+                with col_t2:
+                    fig6 = px.bar(df_top, x="couverts", y="recette", orientation="h",
+                                  labels={"couverts": "Couverts", "recette": ""},
+                                  color="couverts", color_continuous_scale="Blues")
+                    fig6.update_layout(height=350, title="Top 10 recettes par couverts",
+                                       coloraxis_showscale=False)
+                    st.plotly_chart(fig6, use_container_width=True)
+
+                # Croiser avec les coûts recettes pour food cost par recette
+                recettes_list_dash = load_recettes()
+                prix_dict_dash = load_ingredients()
+                food_cost_rows = []
+                for _, row in df_top.iterrows():
+                    rec_obj = next((r for r in recettes_list_dash if r["nom"] == row["recette"]), None)
+                    if rec_obj:
+                        _, cout_total, _ = _calcul_fiche(rec_obj, prix_dict_dash)
+                        nb_cvts = rec_obj.get("nb_couverts", 1) or 1
+                        cout_couvert = cout_total / nb_cvts
+                        ca_couvert = row["prix_moyen_couvert"]
+                        marge = ca_couvert - cout_couvert
+                        fc_pct = (cout_couvert / ca_couvert * 100) if ca_couvert > 0 else 0
+                        food_cost_rows.append({
+                            "Recette": row["recette"],
+                            "CA total (€)": round(row["ca"], 2),
+                            "Couverts": int(row["couverts"]),
+                            "Prix vente/couvert (€)": round(ca_couvert, 2),
+                            "Coût matière/couvert (€)": round(cout_couvert, 3),
+                            "Marge/couvert (€)": round(marge, 2),
+                            "Food Cost %": round(fc_pct, 1),
+                        })
+                if food_cost_rows:
+                    st.markdown("**Analyse Food Cost par recette**")
+                    df_fc = pd.DataFrame(food_cost_rows)
+                    st.dataframe(df_fc, use_container_width=True, hide_index=True,
+                        column_config={
+                            "CA total (€)": st.column_config.NumberColumn(format="%.2f €"),
+                            "Prix vente/couvert (€)": st.column_config.NumberColumn(format="%.2f €"),
+                            "Coût matière/couvert (€)": st.column_config.NumberColumn(format="%.3f €"),
+                            "Marge/couvert (€)": st.column_config.NumberColumn(format="%.2f €"),
+                            "Food Cost %": st.column_config.ProgressColumn(
+                                min_value=0, max_value=100, format="%.1f %%"),
+                        })
