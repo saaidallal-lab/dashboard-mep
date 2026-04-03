@@ -934,7 +934,6 @@ page = st.sidebar.radio(
 st.sidebar.divider()
 st.sidebar.subheader("📥 Exporter des données")
 
-@st.cache_data(show_spinner=False, ttl=60)
 def generate_csv_zip_from_db():
     import io, zipfile, pandas as pd
     try:
@@ -1073,7 +1072,7 @@ if page == "Dashboard Global":
                 text=last_6_weeks['Kg produits global'].fillna(0).round(0).astype(int).astype(str) + " <i>kg</i>",
                 textposition='inside',
                 insidetextanchor='middle',
-                textfont=dict(color='white', weight='bold')
+                textfont=dict(color='white')
             ),
             secondary_y=False,
         )
@@ -1088,7 +1087,7 @@ if page == "Dashboard Global":
                 mode='lines+markers+text',
                 text=last_6_weeks['Global_kg_h'].round(1).astype(str) + " <i>kg/h</i>",
                 textposition='top center',
-                textfont=dict(weight='bold', size=13, color='#ffe0b2')
+                textfont=dict(size=13, color='#ffe0b2')
             ),
             secondary_y=True,
         )
@@ -1177,7 +1176,7 @@ if page == "Dashboard Global":
                     text=kilos_for_ek.fillna(0).round(0).astype(int).astype(str) + " kg",
                     textposition='inside',
                     insidetextanchor='middle',
-                    textfont=dict(color='black', weight='bold') # Enforcing black bold
+                    textfont=dict(color='black') # Enforcing black bold
                 ),
                 secondary_y=False,
             )
@@ -1191,7 +1190,7 @@ if page == "Dashboard Global":
                     mode='lines+markers+text',
                     text=last_6_weeks['Euro_kilo_global'].round(2).astype(str) + " €/<i>kg</i>",
                     textposition='top center',
-                    textfont=dict(color='#2ca02c', weight='bold'),
+                    textfont=dict(color='#2ca02c'),
                     line=dict(color='#2ca02c', width=3),
                     marker=dict(size=8)
                 ),
@@ -1399,7 +1398,7 @@ elif page in ["Chaud", "Légumerie", "Sushi", "Découpe", "Mix", "Mélange", "D�
                         text=last_6_weeks['Kg Sushi'].fillna(0).round(1).astype(str) + " <i>kg</i>",
                         textposition='inside',
                         insidetextanchor='middle',
-                        textfont=dict(weight='bold', color='black')
+                        textfont=dict(color='black')
                     ),
                     secondary_y=False,
                 )
@@ -1413,7 +1412,7 @@ elif page in ["Chaud", "Légumerie", "Sushi", "Découpe", "Mix", "Mélange", "D�
                         text=last_6_weeks[col_name].fillna(0).round(0).astype(int).astype(str) + " <i>h</i>",
                         textposition='inside',
                         insidetextanchor='middle',
-                        textfont=dict(weight='bold', color='black')
+                        textfont=dict(color='black')
                     ),
                     secondary_y=False,
                 )
@@ -1428,7 +1427,7 @@ elif page in ["Chaud", "Légumerie", "Sushi", "Découpe", "Mix", "Mélange", "D�
                         mode='lines+markers+text',
                         text=last_6_weeks[kgh_col].round(1).astype(str) + " <i>kg/h</i>",
                         textposition='top center',
-                        textfont=dict(weight='bold', size=13, color=c_texte_fonce)
+                        textfont=dict(size=13, color=c_texte_fonce)
                     ),
                     secondary_y=True,
                 )
