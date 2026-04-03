@@ -2644,3 +2644,181 @@ elif page == "Ventes & CA":
                             "Food Cost %": st.column_config.ProgressColumn(
                                 min_value=0, max_value=100, format="%.1f %%"),
                         })
+
+# ─────────────────────────────────────────────────────────
+# PAGE : INTÉGRATIONS CAISSE & LIVRAISON
+# ─────────────────────────────────────────────────────────
+elif page == "Intégrations":
+    st.title("🔌 Intégrations Caisse & Livraison")
+    st.caption("Connectez vos outils pour synchroniser automatiquement vos ventes dans le dashboard.")
+
+    # Charger les connexions sauvegardées
+    connexions: dict = {}
+    for _doc in _db.collection(COLLECTION_CONNEXIONS).stream():
+        connexions[_doc.id] = _doc.to_dict()
+
+    # Définition des systèmes
+    POS_SYSTEMS = [
+        {
+            "id": "tiller",
+            "nom": "Tiller by SumUp",
+            "icon": "💳",
+            "desc": "N°1 en France — +10 000 restaurants, tablette iPad, cloud",
+            "color": "#1A73E8",
+            "doc_url": "https://developer.sumup.com/docs",
+            "fields": [
+                {"key": "api_key", "label": "Bearer Token (API Key)", "secret": True,
+                 "help": "Disponible dans votre espace SumUp Developer → Applications → Access Token"},
+            ],
+        },
+        {
+            "id": "laddition",
+            "nom": "L'Addition",
+            "icon": "🍽️",
+            "desc": "100% française, spécialisée restauration, +12 000 établissements",
+            "color": "#C0392B",
+            "doc_url": "https://api.laddition.com",
+            "fields": [
+                {"key": "api_key", "label": "Clé API", "secret": True,
+                 "help": "Paramètres → Intégrations → Clé API"},
+                {"key": "restaurant_id", "label": "ID Restaurant", "secret": False,
+                 "help": "Visible dans l'URL de votre back-office L'Addition"},
+            ],
+        },
+        {
+            "id": "lightspeed",
+            "nom": "Lightspeed Restaurant",
+            "icon": "⚡",
+            "desc": "Solution premium cloud (ex-iKentoo), très utilisée à Paris",
+            "color": "#FF6B35",
+            "doc_url": "https://developers.lightspeedhq.com/restaurant",
+            "fields": [
+                {"key": "account_id", "label": "Account ID", "secret": False,
+                 "help": "Visible dans Settings → Account Information"},
+                {"key": "api_key", "label": "Clé API (Bearer Token)", "secret": True,
+                 "help": "Générée dans Settings → API Access → Create Token"},
+            ],
+        },
+        {
+            "id": "zelty",
+            "nom": "Zelty",
+            "icon": "🟢",
+            "desc": "Made in France, cloud natif, interface ultra-simple",
+            "color": "#00A86B",
+            "doc_url": "https://zelty.fr/api",
+            "fields": [
+                {"key": "api_token", "label": "Token API", "secret": True,
+                 "help": "Réglages → Intégrations → API → Générer un token"},
+            ],
+        },
+        {
+            "id": "ubereats",
+            "nom": "Uber Eats",
+            "icon": "🛵",
+            "desc": "Synchronisez vos commandes Uber Eats for Restaurants",
+            "color": "#06C167",
+            "doc_url": "https://developer.uber.com/docs/eats",
+            "fields": [
+                {"key": "client_id", "label": "Client ID", "secret": False,
+                 "help": "developer.uber.com → My Apps → votre app → Credentials"},
+                {"key": "client_secret", "label": "Client Secret", "secret": True,
+                 "help": "developer.uber.com → My Apps → votre app → Credentials"},
+                {"key": "store_id", "label": "Store UUID", "secret": False,
+                 "help": "Disponible dans Uber Eats Manager → votre restaurant → UUID dans l'URL"},
+            ],
+        },
+    ]
+
+    # Afficher 2 cartes par ligne (5 systèmes = 2+2+1)
+    for row_start in range(0, len(POS_SYSTEMS), 2):
+        row_systems = POS_SYSTEMS[row_start:row_start + 2]
+        cols = st.columns(len(row_systems), gap="large")
+
+        for col_idx, pos in enumerate(row_systems):
+            conn = connexions.get(pos["id"], {})
+            is_connected = conn.get("connected", False)
+            status_dot = "#22C55E" if is_connected else "#94A3B8"
+            status_txt = "✅ Connecté" if is_connected else "⚫ Non connecté"
+            last_sync = conn.get("updated_at", "")
+
+            with cols[col_idx]:
+                st.markdown(f"""
+<div style="border:2px solid {pos['color']};border-radius:16px;padding:18px 20px 14px;
+            background:linear-gradient(135deg,{pos['color']}18,#ffffff);">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+    <span style="font-size:1.9rem;line-height:1">{pos['icon']}</span>
+    <span style="background:{status_dot};color:white;padding:3px 11px;
+                 border-radius:20px;font-size:0.75em;font-weight:700;">{status_txt}</span>
+  </div>
+  <div style="font-size:1.05rem;font-weight:700;color:{pos['color']};margin-bottom:2px;">{pos['nom']}</div>
+  <div style="font-size:0.8em;color:#64748B;">{pos['desc']}</div>
+  {f'<div style="font-size:0.72em;color:#94A3B8;margin-top:4px;">Dernière sync : {last_sync}</div>' if last_sync else ''}
+</div>""", unsafe_allow_html=True)
+
+                st.markdown(f"[📖 Documentation API]({pos['doc_url']})")
+
+                with st.expander("⚙️ Configurer", expanded=not is_connected):
+                    with st.form(f"form_{pos['id']}"):
+                        field_vals: dict = {}
+                        for field in pos["fields"]:
+                            field_vals[field["key"]] = st.text_input(
+                                field["label"],
+                                value=conn.get(field["key"], ""),
+                                help=field["help"],
+                                type="password" if field.get("secret") else "default",
+                                key=f"inp_{pos['id']}_{field['key']}",
+                            )
+                        btn_save, btn_test = st.columns(2)
+                        with btn_save:
+                            do_save = st.form_submit_button("💾 Sauvegarder", use_container_width=True)
+                        with btn_test:
+                            do_test = st.form_submit_button("🔍 Tester", type="primary", use_container_width=True)
+
+                        if do_save:
+                            _db.collection(COLLECTION_CONNEXIONS).document(pos["id"]).set(
+                                {**field_vals, "connected": False, "updated_at": str(date.today())},
+                                merge=True
+                            )
+                            st.success("Identifiants sauvegardés.")
+                            st.cache_data.clear()
+                            st.rerun()
+
+                        if do_test:
+                            with st.spinner("Test en cours..."):
+                                ok_t, msg_t = _test_pos_connection(pos["id"], field_vals)
+                            if ok_t:
+                                _db.collection(COLLECTION_CONNEXIONS).document(pos["id"]).set(
+                                    {**field_vals, "connected": True, "updated_at": str(date.today())},
+                                    merge=True
+                                )
+                                st.success(f"✅ {msg_t}")
+                                st.cache_data.clear()
+                                st.rerun()
+                            else:
+                                _db.collection(COLLECTION_CONNEXIONS).document(pos["id"]).set(
+                                    {"connected": False}, merge=True
+                                )
+                                st.error(f"❌ {msg_t}")
+
+                if is_connected:
+                    if st.button(f"🔄 Synchroniser les ventes", key=f"sync_{pos['id']}",
+                                 use_container_width=True):
+                        with st.spinner("Synchronisation en cours..."):
+                            res = _sync_pos_data(pos["id"], conn)
+                        if res["success"]:
+                            st.success(f"✅ {res['message']}")
+                            st.cache_data.clear()
+                        else:
+                            st.error(f"❌ {res['message']}")
+
+        st.markdown("")  # espacement entre les rangées
+
+    # ── Récapitulatif des connexions actives ─────────────────────────────────
+    st.divider()
+    actives = [(pos["nom"], pos["icon"]) for pos in POS_SYSTEMS
+               if connexions.get(pos["id"], {}).get("connected", False)]
+    if actives:
+        st.markdown(f"**{len(actives)} intégration(s) active(s) :** "
+                    + "  |  ".join(f"{icon} {nom}" for icon, nom in actives))
+    else:
+        st.info("Aucune intégration connectée. Configurez vos outils ci-dessus pour importer vos ventes automatiquement.")
