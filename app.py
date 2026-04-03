@@ -1005,8 +1005,7 @@ page = st.sidebar.radio(
 st.sidebar.divider()
 st.sidebar.subheader("📥 Exporter des données")
 
-@st.cache_data(ttl=60, show_spinner=False)
-def generate_csv_zip_from_db():
+def create_export_zip():
     import io, zipfile, pandas as pd
     try:
         dfs = {}
@@ -1045,16 +1044,23 @@ def generate_csv_zip_from_db():
 
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+            empty_all = True
             for sheet_name, df in dfs.items():
                 if isinstance(df, pd.DataFrame) and not df.empty:
+                    empty_all = False
                     safe_name = sheet_name.replace("/", "_").replace("\\", "_")
                     zf.writestr(f"Export_{safe_name}.csv", df.to_csv(index=False).encode('utf-8'))
+            if empty_all:
+                return None
+                
         return zip_buffer.getvalue()
     except Exception as e:
         st.sidebar.error(f"Erreur d'export: {e}")
         return None
 
-zip_data = generate_csv_zip_from_db()
+with st.sidebar.spinner("Préparation de l'export..."):
+    zip_data = create_export_zip()
+
 if zip_data:
     st.sidebar.download_button(
         label="Extraire les données en CSV (ZIP)",
