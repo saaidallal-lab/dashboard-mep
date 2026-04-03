@@ -934,32 +934,66 @@ page = st.sidebar.radio(
 st.sidebar.divider()
 st.sidebar.subheader("📥 Exporter des données")
 
-@st.cache_data(show_spinner=False)
-def generate_csv_zip(file_path):
-    import os, io, zipfile, pandas as pd
-    if not os.path.exists(file_path):
-        return None
+@st.cache_data(show_spinner=False, ttl=60)
+def generate_csv_zip_from_db():
+    import io, zipfile, pandas as pd
     try:
-        dfs = pd.read_excel(file_path, sheet_name=None)
+        dfs = {}
+        # KPI 2026
+        try:
+            dfs["Kpi_2026"] = load_data()
+        except Exception:
+            pass
+            
+        # Recettes
+        try:
+            dfs["Recettes"] = pd.DataFrame(load_recettes())
+        except Exception:
+            pass
+            
+        # Ingredients
+        try:
+            dfs["Ingredients"] = pd.DataFrame(list(load_ingredients().values()))
+        except Exception:
+            pass
+            
+        # Factures
+        try:
+            dfs["Factures"] = pd.DataFrame(load_factures())
+        except Exception:
+            pass
+            
+        # Ventes
+        try:
+            dfs["Ventes"] = pd.DataFrame(load_ventes())
+        except Exception:
+            pass
+
+        if not dfs:
+            return None
+
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
             for sheet_name, df in dfs.items():
-                safe_name = sheet_name.replace("/", "_").replace("\\", "_")
-                zf.writestr(f"Suivi_heures_mep_{safe_name}.csv", df.to_csv(index=False).encode('utf-8'))
+                if isinstance(df, pd.DataFrame) and not df.empty:
+                    safe_name = sheet_name.replace("/", "_").replace("\\", "_")
+                    zf.writestr(f"Export_{safe_name}.csv", df.to_csv(index=False).encode('utf-8'))
         return zip_buffer.getvalue()
     except Exception as e:
         st.sidebar.error(f"Erreur d'export: {e}")
         return None
 
-zip_data = generate_csv_zip("Suivi heures mep.xlsx")
+zip_data = generate_csv_zip_from_db()
 if zip_data:
     st.sidebar.download_button(
-        label="Extraire tous les onglets en CSV (ZIP)",
+        label="Extraire les données en CSV (ZIP)",
         data=zip_data,
-        file_name="extractions_csv_onglets.zip",
+        file_name="extractions_donnees.zip",
         mime="application/zip",
         use_container_width=True
     )
+else:
+    st.sidebar.warning("Aucune donnée à exporter ou base inaccessible.")
 # --- PAGE 1 : DASHBOARD GLOBAL ---
 if page == "Dashboard Global":
     st.title("📊 Dashboard Global Production")
