@@ -18,9 +18,11 @@ warnings.filterwarnings('ignore')
 FIRESTORE_COLLECTION = "kpi_2026"
 COLLECTION_RECETTES   = "recettes"
 COLLECTION_INGREDIENTS = "ingredients"
-COLLECTION_FACTURES   = "factures"
-COLLECTION_VENTES     = "ventes"
-COLLECTION_CONNEXIONS = "connexions"
+COLLECTION_FACTURES         = "factures"
+COLLECTION_VENTES           = "ventes"
+COLLECTION_CONNEXIONS       = "connexions"
+COLLECTION_FOURNISSEURS     = "fournisseurs"
+COLLECTION_STOCK_MOUVEMENTS = "stock_mouvements"
 
 def _get_firestore_client():
     """
@@ -226,6 +228,19 @@ def load_ventes():
 def load_connexions():
     docs = _db.collection(COLLECTION_CONNEXIONS).stream()
     return {d.id: d.to_dict() for d in docs}
+
+@st.cache_data(ttl=60)
+def load_fournisseurs():
+    docs = _db.collection(COLLECTION_FOURNISSEURS).stream()
+    return sorted([{"id": d.id, **d.to_dict()} for d in docs], key=lambda x: x.get("nom", ""))
+
+@st.cache_data(ttl=30)
+def load_stock_mouvements(limit: int = 300):
+    docs = (_db.collection(COLLECTION_STOCK_MOUVEMENTS)
+            .order_by("date", direction=firestore.Query.DESCENDING)
+            .limit(limit)
+            .stream())
+    return [{"id": d.id, **d.to_dict()} for d in docs]
 
 def _get_semaine_iso(date_str):
     """Retourne le numéro de semaine ISO pour une date YYYY-MM-DD."""
@@ -832,6 +847,39 @@ def _sync_pos_data(pos_id: str, creds: dict):
         return {"success": False, "message": f"Erreur : {e}"}
 
 
+# ─────────────────────────────────────────────────────────
+# GESTION DES STOCKS — HELPER
+# ─────────────────────────────────────────────────────────
+_MOUVEMENT_SIGNS = {"entree": 1, "sortie": -1, "perte": -1, "inventaire": 0}
+
+def _creer_mouvement(ingredient_id: str, ingredient_nom: str, type_mvt: str,
+                     quantite: float, source: str, source_id: str = "", unite: str = "kg"):
+    """
+    Enregistre un mouvement de stock (journal immuable) ET met à jour
+    stock_actuel_kg sur l'ingrédient via Firestore Increment.
+    type_mvt : 'entree' | 'sortie' | 'perte' | 'inventaire'
+    """
+    if quantite <= 0:
+        return
+    _db.collection(COLLECTION_STOCK_MOUVEMENTS).document(str(uuid.uuid4())).set({
+        "ingredient_id":  ingredient_id,
+        "ingredient_nom": ingredient_nom,
+        "type":           type_mvt,
+        "quantite_kg":    round(quantite, 4),
+        "unite":          unite,
+        "date":           str(date.today()),
+        "source":         source,
+        "source_id":      source_id,
+        "created_at":     str(date.today()),
+    })
+    sign = _MOUVEMENT_SIGNS.get(type_mvt, 0)
+    if sign != 0:
+        _db.collection(COLLECTION_INGREDIENTS).document(ingredient_id).set(
+            {"stock_actuel_kg": firestore.Increment(sign * round(quantite, 4))},
+            merge=True,
+        )
+
+
 # --- EMOJIS MAPPING ---
 POSTES_EMOJIS = {
     "Dashboard Global": "🌍 Dashboard Global",
@@ -848,6 +896,8 @@ POSTES_EMOJIS = {
     "Factures": "🧾 Factures",
     "Saisie de données": "✏️ Saisie de données",
     "Ventes & CA": "💰 Ventes & CA",
+    "Stocks": "📦 Stocks",
+    "Fournisseurs": "🚚 Fournisseurs",
     "Intégrations": "🔌 Intégrations",
     "Mes Apps": "📱 Mes Apps",
 }
@@ -2044,9 +2094,13 @@ elif page == "Fiches Techniques":
 
         unite_opts = ["kg", "L", "pièce", "colis", "boîte"]
         cur_unite = cat_existing.get("unite", "kg")
+        cat_opts = ["Viande & Poisson", "Légumes & Fruits", "Épicerie sèche",
+                    "Produits laitiers", "Boissons", "Surgelés", "Autre"]
+        cur_cat = cat_existing.get("categorie", "Autre")
 
         with st.form("form_catalogue_add"):
             f_nom_c = st.text_input("Nom de l'ingrédient *", value=nom_default)
+
             col_ca, col_cb, col_cc = st.columns(3)
             with col_ca:
                 f_prix_c = st.number_input("Prix (€/unité)", min_value=0.0,
@@ -2055,7 +2109,19 @@ elif page == "Fiches Techniques":
                 f_unite_c = st.selectbox("Unité",
                     unite_opts, index=unite_opts.index(cur_unite) if cur_unite in unite_opts else 0)
             with col_cc:
+                f_cat_c = st.selectbox("Catégorie",
+                    cat_opts, index=cat_opts.index(cur_cat) if cur_cat in cat_opts else len(cat_opts)-1)
+
+            col_cd, col_ce, col_cf = st.columns(3)
+            with col_cd:
                 f_fourn_c = st.text_input("Fournisseur", value=cat_existing.get("fournisseur", ""))
+            with col_ce:
+                f_cond_c = st.text_input("Conditionnement", value=cat_existing.get("conditionnement", ""),
+                    placeholder="ex: colis 5 kg")
+            with col_cf:
+                f_alerte_c = st.number_input("Seuil d'alerte (kg)", min_value=0.0,
+                    value=float(cat_existing.get("stock_alerte_kg", 0.0)), step=0.5, format="%.1f",
+                    help="Le stock passe en alerte en dessous de ce seuil")
 
             if st.form_submit_button("💾 Enregistrer", type="primary"):
                 if not f_nom_c.strip():
@@ -2066,7 +2132,10 @@ elif page == "Fiches Techniques":
                         "nom": f_nom_c.strip(),
                         "prix_unitaire": f_prix_c,
                         "unite": f_unite_c,
+                        "categorie": f_cat_c,
                         "fournisseur": f_fourn_c,
+                        "conditionnement": f_cond_c,
+                        "stock_alerte_kg": f_alerte_c,
                         "updated_at": str(date.today()),
                     }, merge=True)
                     st.cache_data.clear()
@@ -2179,15 +2248,24 @@ elif page == "Factures":
                             "updated_at": str(date.today())
                         }
                         if ing_id not in existing_ids:
-                            # Nouvel ingrédient : toujours créer avec prix
                             ing_data["prix_unitaire"] = lg["prix_unitaire"]
                             _db.collection(COLLECTION_INGREDIENTS).document(ing_id).set(ing_data)
                             nb_crees += 1
                         elif maj_btn and lg["prix_unitaire"] > 0:
-                            # Ingrédient existant : MAJ prix seulement si bouton MAJ
                             ing_data["prix_unitaire"] = lg["prix_unitaire"]
                             _db.collection(COLLECTION_INGREDIENTS).document(ing_id).set(ing_data, merge=True)
                             nb_maj += 1
+                        # Mouvement de stock : entrée à chaque ligne de facture
+                        if lg.get("quantite", 0) > 0:
+                            _creer_mouvement(
+                                ingredient_id=ing_id,
+                                ingredient_nom=nom,
+                                type_mvt="entree",
+                                quantite=float(lg["quantite"]),
+                                unite=lg.get("unite", "kg"),
+                                source="facture",
+                                source_id=fac_doc.get("numero", ""),
+                            )
 
                     msg = "Facture enregistrée !"
                     if nb_crees: msg += f" {nb_crees} nouvel(s) ingrédient(s) créé(s)."
@@ -2233,6 +2311,18 @@ elif page == "Factures":
                         "total_ht": m_tht_tot, "tva": m_tva_tot, "total_ttc": m_ttc_tot,
                         "statut": "validée", "created_at": str(date.today())
                     })
+                    # Mouvements de stock pour chaque ligne
+                    for lg in m_lignes:
+                        nom = lg.get("article", "").strip()
+                        if not nom or float(lg.get("quantite", 0)) <= 0:
+                            continue
+                        ing_id = nom.lower().replace(" ", "_").replace("'", "").replace("é","e").replace("è","e").replace("ê","e")
+                        _creer_mouvement(
+                            ingredient_id=ing_id, ingredient_nom=nom,
+                            type_mvt="entree", quantite=float(lg["quantite"]),
+                            unite=lg.get("unite", "kg"),
+                            source="facture", source_id=m_num,
+                        )
                     st.cache_data.clear()
                     st.success("Facture enregistrée !")
                     st.rerun()
@@ -2958,3 +3048,202 @@ elif page == "Mes Apps":
             "- Une **description** courte\n\n"
             "Les apps sont configurées directement dans le code (`APPS` liste dans la page 'Mes Apps')."
         )
+
+# ─────────────────────────────────────────────────────────
+# PAGE : FOURNISSEURS
+# ─────────────────────────────────────────────────────────
+elif page == "Fournisseurs":
+    st.title("🚚 Fournisseurs")
+    fournisseurs_list = load_fournisseurs()
+
+    # ── Liste ──────────────────────────────────────────────
+    if fournisseurs_list:
+        df_f = pd.DataFrame([{
+            "Nom":             f.get("nom", ""),
+            "Contact":         f.get("contact", ""),
+            "Email":           f.get("email", ""),
+            "Téléphone":       f.get("telephone", ""),
+            "Délai livraison": f"{f.get('delai_livraison', '—')} j",
+            "Jours commande":  ", ".join(f.get("jours_commande", [])),
+        } for f in fournisseurs_list])
+        st.dataframe(df_f, use_container_width=True, hide_index=True)
+    else:
+        st.info("Aucun fournisseur. Ajoutez-en ci-dessous.")
+
+    st.divider()
+
+    # ── Formulaire ajouter / modifier ────────────────────
+    st.markdown("#### Ajouter / Modifier un fournisseur")
+    jours_opts = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
+    fourn_names = ["— Nouveau —"] + [f["nom"] for f in fournisseurs_list]
+    fourn_sel = st.selectbox("Créer ou modifier :", fourn_names, key="fourn_sel")
+    fourn_ex = next((f for f in fournisseurs_list if f["nom"] == fourn_sel), {})
+
+    with st.form("form_fournisseur"):
+        fa, fb = st.columns(2)
+        with fa:
+            f_nom_f   = st.text_input("Nom *", value=fourn_ex.get("nom", ""))
+            f_email   = st.text_input("Email", value=fourn_ex.get("email", ""))
+            f_delai   = st.number_input("Délai livraison (jours)", min_value=0, max_value=14,
+                                         value=int(fourn_ex.get("delai_livraison", 1)))
+        with fb:
+            f_contact = st.text_input("Contact", value=fourn_ex.get("contact", ""))
+            f_tel     = st.text_input("Téléphone", value=fourn_ex.get("telephone", ""))
+            cur_jours = fourn_ex.get("jours_commande", [])
+            f_jours   = st.multiselect("Jours de commande", jours_opts, default=cur_jours)
+
+        f_notes = st.text_area("Notes", value=fourn_ex.get("notes", ""), height=60)
+
+        if st.form_submit_button("💾 Enregistrer", type="primary"):
+            if not f_nom_f.strip():
+                st.error("Le nom est obligatoire.")
+            else:
+                fourn_id = fourn_ex.get("id") or f_nom_f.strip().lower().replace(" ", "_").replace("'", "")
+                _db.collection(COLLECTION_FOURNISSEURS).document(fourn_id).set({
+                    "nom": f_nom_f.strip(), "contact": f_contact, "email": f_email,
+                    "telephone": f_tel, "delai_livraison": f_delai,
+                    "jours_commande": f_jours, "notes": f_notes,
+                    "updated_at": str(date.today()),
+                }, merge=True)
+                st.cache_data.clear()
+                st.success(f"✅ '{f_nom_f.strip()}' enregistré.")
+                st.rerun()
+
+    # ── Suppression ────────────────────────────────────────
+    if fournisseurs_list:
+        st.divider()
+        with st.expander("🗑️ Supprimer un fournisseur"):
+            del_fourn = st.selectbox("Fournisseur à supprimer :", [f["nom"] for f in fournisseurs_list], key="del_fourn")
+            if st.button("Confirmer la suppression", type="primary", key="del_fourn_btn"):
+                del_id = next((f["id"] for f in fournisseurs_list if f["nom"] == del_fourn), None)
+                if del_id:
+                    _db.collection(COLLECTION_FOURNISSEURS).document(del_id).delete()
+                    st.cache_data.clear()
+                    st.warning(f"'{del_fourn}' supprimé.")
+                    st.rerun()
+
+# ─────────────────────────────────────────────────────────
+# PAGE : STOCKS
+# ─────────────────────────────────────────────────────────
+elif page == "Stocks":
+    st.title("📦 Gestion des Stocks")
+    prix_dict = load_ingredients()
+
+    if not prix_dict:
+        st.info("Aucun ingrédient dans le catalogue. Ajoutez des ingrédients via 'Fiches Techniques → Catalogue'.")
+        st.stop()
+
+    # ── Calcul des indicateurs ─────────────────────────────
+    stock_rows = []
+    valeur_totale = 0.0
+    nb_alertes    = 0
+    for nom, info in sorted(prix_dict.items()):
+        stock   = float(info.get("stock_actuel_kg", 0.0))
+        alerte  = float(info.get("stock_alerte_kg", 0.0))
+        prix    = float(info.get("prix_unitaire", 0.0))
+        valeur  = round(stock * prix, 2)
+        valeur_totale += valeur
+
+        if alerte > 0 and stock <= alerte:
+            statut = "🔴 Alerte"
+            nb_alertes += 1
+        elif alerte > 0 and stock <= alerte * 1.5:
+            statut = "🟡 Bas"
+        else:
+            statut = "🟢 OK"
+
+        stock_rows.append({
+            "Ingrédient":        nom,
+            "Catégorie":         info.get("categorie", "—"),
+            "Stock actuel (kg)": round(stock, 3),
+            "Seuil alerte (kg)": alerte if alerte > 0 else "—",
+            "Prix/unité (€)":    prix,
+            "Valeur stock (€)":  valeur,
+            "Fournisseur":       info.get("fournisseur", "—"),
+            "Statut":            statut,
+        })
+
+    # ── KPIs ───────────────────────────────────────────────
+    sk1, sk2, sk3, sk4 = st.columns(4)
+    sk1.metric("Valeur totale stock", f"{valeur_totale:,.2f} €")
+    sk2.metric("Nb ingrédients", len(stock_rows))
+    sk3.metric("🔴 En alerte", nb_alertes,
+               delta=f"{nb_alertes} à commander" if nb_alertes else None,
+               delta_color="inverse")
+    sk4.metric("Stock moyen / ingrédient",
+               f"{(valeur_totale / len(stock_rows)):.2f} €" if stock_rows else "—")
+
+    st.divider()
+
+    # ── Filtres ────────────────────────────────────────────
+    sf1, sf2 = st.columns([2, 1])
+    with sf1:
+        cats_dispo = sorted(set(r["Catégorie"] for r in stock_rows if r["Catégorie"] != "—"))
+        filtre_cat = st.multiselect("Filtrer par catégorie", cats_dispo, placeholder="Toutes")
+    with sf2:
+        filtre_statut = st.selectbox("Statut", ["Tous", "🔴 Alerte", "🟡 Bas", "🟢 OK"])
+
+    df_stock = pd.DataFrame(stock_rows)
+    if filtre_cat:
+        df_stock = df_stock[df_stock["Catégorie"].isin(filtre_cat)]
+    if filtre_statut != "Tous":
+        df_stock = df_stock[df_stock["Statut"] == filtre_statut]
+    df_stock = df_stock.sort_values("Valeur stock (€)", ascending=False)
+
+    st.dataframe(df_stock, use_container_width=True, hide_index=True,
+        column_config={
+            "Valeur stock (€)": st.column_config.NumberColumn(format="%.2f €"),
+            "Stock actuel (kg)": st.column_config.NumberColumn(format="%.3f"),
+            "Prix/unité (€)": st.column_config.NumberColumn(format="%.2f €"),
+        })
+
+    st.divider()
+
+    # ── Saisie mouvement manuel ────────────────────────────
+    st.markdown("#### ✏️ Saisir un mouvement de stock")
+    st.caption("Utilisez ceci pour les pertes, corrections ou sorties non liées à une facture.")
+    with st.form("form_mouvement_manuel"):
+        mv1, mv2, mv3 = st.columns(3)
+        with mv1:
+            mv_ing = st.selectbox("Ingrédient *", sorted(prix_dict.keys()))
+        with mv2:
+            mv_type = st.selectbox("Type", ["sortie", "perte", "entree"])
+        with mv3:
+            mv_qty = st.number_input("Quantité (kg)", min_value=0.001, step=0.1, format="%.3f")
+        mv_note = st.text_input("Note / motif", placeholder="ex: perte cuisson, correction inventaire")
+
+        if st.form_submit_button("Enregistrer le mouvement", type="primary"):
+            mv_id = mv_ing.lower().replace(" ", "_").replace("'", "")
+            _creer_mouvement(
+                ingredient_id=mv_id, ingredient_nom=mv_ing,
+                type_mvt=mv_type, quantite=mv_qty,
+                unite=prix_dict[mv_ing].get("unite", "kg"),
+                source="manuel", source_id=mv_note,
+            )
+            st.cache_data.clear()
+            st.success(f"✅ Mouvement enregistré : {mv_type} de {mv_qty:.3f} kg de {mv_ing}.")
+            st.rerun()
+
+    st.divider()
+
+    # ── Journal des mouvements ─────────────────────────────
+    st.markdown("#### 📋 Journal des mouvements récents")
+    mouvements = load_stock_mouvements(limit=200)
+    if mouvements:
+        df_mvt = pd.DataFrame([{
+            "Date":        m.get("date", ""),
+            "Ingrédient":  m.get("ingredient_nom", ""),
+            "Type":        m.get("type", ""),
+            "Quantité":    f"{m.get('quantite_kg', 0):.3f} {m.get('unite','kg')}",
+            "Source":      m.get("source", ""),
+            "Référence":   m.get("source_id", ""),
+        } for m in mouvements])
+        # Coloration par type
+        def _color_type(val):
+            colors = {"entree": "background-color:#d4edda", "sortie": "background-color:#fff3cd",
+                      "perte": "background-color:#f8d7da", "inventaire": "background-color:#d1ecf1"}
+            return colors.get(val, "")
+        st.dataframe(df_mvt.style.applymap(_color_type, subset=["Type"]),
+                     use_container_width=True, hide_index=True)
+    else:
+        st.info("Aucun mouvement enregistré. Les entrées apparaîtront ici dès la validation d'une facture.")
