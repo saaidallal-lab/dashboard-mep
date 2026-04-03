@@ -124,6 +124,23 @@ st.markdown("""
         h1, h2, h3 {
             font-weight: 700 !important;
         }
+        .app-card {
+            border-radius: 16px;
+            padding: 22px 20px 18px;
+            margin-bottom: 6px;
+            transition: transform .15s;
+        }
+        .app-card:hover { transform: translateY(-2px); }
+        .app-tag {
+            display: inline-block;
+            background: rgba(255,255,255,0.25);
+            color: white;
+            font-size: 0.7em;
+            font-weight: 600;
+            padding: 2px 9px;
+            border-radius: 12px;
+            margin-top: 6px;
+        }
     </style>
 """, unsafe_allow_html=True)
 
@@ -204,6 +221,11 @@ def load_ventes():
     docs = _db.collection(COLLECTION_VENTES).stream()
     return sorted([{"id": d.id, **d.to_dict()} for d in docs],
                   key=lambda x: x.get("date", ""), reverse=True)
+
+@st.cache_data(ttl=60)
+def load_connexions():
+    docs = _db.collection(COLLECTION_CONNEXIONS).stream()
+    return {d.id: d.to_dict() for d in docs}
 
 def _get_semaine_iso(date_str):
     """Retourne le numéro de semaine ISO pour une date YYYY-MM-DD."""
@@ -566,7 +588,7 @@ Règles impératives :
         return {"error": str(e)}
 
 
-def _extract_facture_vision(image_bytes: bytes, media_type: str = "image/jpeg") -> dict:
+def _extract_facture_vision(image_bytes: bytes) -> dict:
     """Utilise Google Cloud Vision (gratuit 1000 req/mois) pour extraire le texte d'une facture."""
     try:
         from google.cloud import vision as gvision
@@ -782,14 +804,14 @@ def _sync_pos_data(pos_id: str, creds: dict):
             )
             if not ok:
                 return {"success": False, "message": f"Erreur {code} Uber Eats."}
-            by_date2: dict = {}
+            by_date_orders: dict = {}
             for o in data.get("orders", []):
                 d = str(o.get("created_at", ""))[:10]
                 total = float(o.get("total", {}).get("price", 0)) / 100
-                entry = by_date2.setdefault(d, {"ca_ttc": 0.0, "nb": 0})
+                entry = by_date_orders.setdefault(d, {"ca_ttc": 0.0, "nb": 0})
                 entry["ca_ttc"] += total
                 entry["nb"] += 1
-            for d, vals in by_date2.items():
+            for d, vals in by_date_orders.items():
                 date_obj = _dt.date.fromisoformat(d)
                 ca_ttc = vals["ca_ttc"]
                 ca_ht = round(ca_ttc / 1.055, 2)
@@ -892,14 +914,12 @@ def _podium_html(top3, emoji_fn, inverse=False):
     """Génère le HTML d'un podium visuel (marches) pour une liste de 1-3 items {poste, delta}."""
     if not top3:
         return ""
-    medals = ["🥇", "🥈", "🥉"]
     bar_colors = [
         "linear-gradient(160deg,#FFD700,#FFA500)",
         "linear-gradient(160deg,#C8C8C8,#9e9e9e)",
         "linear-gradient(160deg,#CD7F32,#8B5E2A)"
     ]
     bar_heights = [115, 80, 55]
-    font_sizes = [2.2, 1.85, 1.55]
     # Ordre visuel : 2e | 1er | 3e
     visual_slots = [1, 0, 2]
 
@@ -935,6 +955,7 @@ page = st.sidebar.radio(
 st.sidebar.divider()
 st.sidebar.subheader("📥 Exporter des données")
 
+@st.cache_data(ttl=60, show_spinner=False)
 def generate_csv_zip_from_db():
     import io, zipfile, pandas as pd
     try:
@@ -1177,7 +1198,7 @@ if page == "Dashboard Global":
                     text=kilos_for_ek.fillna(0).round(0).astype(int).astype(str) + " kg",
                     textposition='inside',
                     insidetextanchor='middle',
-                    textfont=dict(color='black') # Enforcing black bold
+                    textfont=dict(color='black')
                 ),
                 secondary_y=False,
             )
@@ -2686,10 +2707,7 @@ elif page == "Intégrations":
     st.title("🔌 Intégrations Caisse & Livraison")
     st.caption("Connectez vos outils pour synchroniser automatiquement vos ventes dans le dashboard.")
 
-    # Charger les connexions sauvegardées
-    connexions: dict = {}
-    for _doc in _db.collection(COLLECTION_CONNEXIONS).stream():
-        connexions[_doc.id] = _doc.to_dict()
+    connexions = load_connexions()
 
     # Définition des systèmes
     POS_SYSTEMS = [
@@ -2904,38 +2922,12 @@ elif page == "Mes Apps":
         },
     ]
 
-    # CSS commun pour les cartes
-    st.markdown("""
-    <style>
-    .app-card {
-        border-radius: 16px;
-        padding: 22px 20px 18px;
-        margin-bottom: 6px;
-        transition: transform .15s;
-    }
-    .app-card:hover { transform: translateY(-2px); }
-    .app-tag {
-        display: inline-block;
-        background: rgba(255,255,255,0.25);
-        color: white;
-        font-size: 0.7em;
-        font-weight: 600;
-        padding: 2px 9px;
-        border-radius: 12px;
-        margin-top: 6px;
-    }
-    </style>
-    """, unsafe_allow_html=True)
-
     # Affichage 2 par ligne
     for i in range(0, len(APPS), 2):
         cols = st.columns(2, gap="large")
         for j, app in enumerate(APPS[i:i+2]):
             with cols[j]:
                 has_url = bool(app["url"])
-                statut_color = "#22C55E" if app["statut"] == "En ligne" else \
-                               "#94A3B8" if app["statut"] == "URL à configurer" else "#3B82F6"
-
                 st.markdown(f"""
 <div class="app-card" style="background:linear-gradient(135deg,{app['color']},{app['color']}CC);
      border: none; box-shadow: 0 6px 20px {app['color']}44;">
