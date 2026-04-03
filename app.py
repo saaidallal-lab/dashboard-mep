@@ -20,6 +20,7 @@ COLLECTION_RECETTES   = "recettes"
 COLLECTION_INGREDIENTS = "ingredients"
 COLLECTION_FACTURES   = "factures"
 COLLECTION_VENTES     = "ventes"
+COLLECTION_CONNEXIONS = "connexions"
 
 def _get_firestore_client():
     """
@@ -603,6 +604,212 @@ try:
 except Exception:
     pass
 
+
+# ─────────────────────────────────────────────────────────
+# FONCTIONS INTÉGRATIONS POS / UBER EATS
+# ─────────────────────────────────────────────────────────
+def _pos_request(method, url, headers=None, params=None, timeout=8):
+    """Wrapper HTTP avec gestion d'erreurs. Retourne (ok, status_code, data_or_error)."""
+    try:
+        import requests as _req
+        resp = _req.request(method, url, headers=headers, params=params, timeout=timeout)
+        if resp.status_code < 400:
+            try:
+                return True, resp.status_code, resp.json()
+            except Exception:
+                return True, resp.status_code, {}
+        return False, resp.status_code, resp.text[:300]
+    except Exception as e:
+        return False, 0, str(e)
+
+
+def _test_pos_connection(pos_id: str, creds: dict):
+    """Teste la connexion à un POS. Retourne (success: bool, message: str)."""
+    if pos_id == "tiller":
+        api_key = creds.get("api_key", "")
+        if not api_key:
+            return False, "Clé API manquante."
+        ok, code, data = _pos_request(
+            "GET", "https://api.sumup.com/v0.1/me",
+            headers={"Authorization": f"Bearer {api_key}"}
+        )
+        if ok:
+            name = data.get("personal_details", {}).get("first_name", "OK")
+            return True, f"Connexion réussie — compte : {name}"
+        return False, f"Erreur {code} : identifiants invalides ou expirés."
+
+    if pos_id == "laddition":
+        api_key = creds.get("api_key", "")
+        if not api_key:
+            return False, "Clé API manquante."
+        ok, code, _ = _pos_request(
+            "GET", "https://api.laddition.com/api/v1/check",
+            headers={"X-Auth-Token": api_key, "Content-Type": "application/json"}
+        )
+        if ok:
+            return True, "Connexion réussie à L'Addition."
+        return False, f"Erreur {code} : vérifiez votre clé API."
+
+    if pos_id == "lightspeed":
+        account_id = creds.get("account_id", "")
+        api_key = creds.get("api_key", "")
+        if not account_id or not api_key:
+            return False, "Account ID et clé API requis."
+        ok, code, data = _pos_request(
+            "GET", f"https://api.lightspeedapp.com/API/V3/Account/{account_id}.json",
+            headers={"Authorization": f"Bearer {api_key}"}
+        )
+        if ok:
+            name = data.get("Account", {}).get("name", "OK")
+            return True, f"Connexion réussie — compte : {name}"
+        return False, f"Erreur {code} : Account ID ou clé API invalide."
+
+    if pos_id == "zelty":
+        api_token = creds.get("api_token", "")
+        if not api_token:
+            return False, "Token API manquant."
+        ok, code, data = _pos_request(
+            "GET", "https://backoffice.zelty.fr/api/2/restaurants",
+            headers={"Authorization": f"Token {api_token}"}
+        )
+        if ok:
+            nb = len(data) if isinstance(data, list) else 1
+            return True, f"Connexion réussie — {nb} restaurant(s) trouvé(s)."
+        return False, f"Erreur {code} : token invalide ou droits insuffisants."
+
+    if pos_id == "ubereats":
+        client_id = creds.get("client_id", "")
+        client_secret = creds.get("client_secret", "")
+        if not client_id or not client_secret:
+            return False, "Client ID et Client Secret requis."
+        try:
+            import requests as _req
+            resp = _req.post(
+                "https://login.uber.com/oauth/v2/token",
+                data={"client_id": client_id, "client_secret": client_secret,
+                      "grant_type": "client_credentials", "scope": "eats.report"},
+                timeout=8,
+            )
+            if resp.status_code == 200:
+                return True, "Connexion Uber Eats réussie — token OAuth obtenu."
+            return False, f"Erreur {resp.status_code} : vérifiez vos identifiants Uber Eats for Restaurants."
+        except Exception as e:
+            return False, str(e)
+
+    return False, "POS non reconnu."
+
+
+def _sync_pos_data(pos_id: str, creds: dict):
+    """Récupère les ventes des 7 derniers jours et les insère dans Firestore."""
+    import datetime as _dt
+    today = _dt.date.today()
+    depuis = str(today - _dt.timedelta(days=7))
+    synced = 0
+
+    try:
+        if pos_id == "tiller":
+            api_key = creds.get("api_key", "")
+            ok, code, data = _pos_request(
+                "GET", "https://api.sumup.com/v0.1/me/transactions/history",
+                headers={"Authorization": f"Bearer {api_key}"},
+                params={"oldest_time": f"{depuis}T00:00:00Z", "statuses[]": "SUCCESSFUL"}
+            )
+            if not ok:
+                return {"success": False, "message": f"Erreur {code}."}
+            by_date: dict = {}
+            for t in data.get("items", []):
+                d = str(t.get("timestamp", ""))[:10]
+                by_date[d] = by_date.get(d, 0.0) + float(t.get("amount", 0))
+            for d, ca_ttc in by_date.items():
+                date_obj = _dt.date.fromisoformat(d)
+                ca_ht = round(ca_ttc / 1.055, 2)
+                _db.collection(COLLECTION_VENTES).document(f"tiller_{d}").set({
+                    "date": d, "semaine": int(date_obj.isocalendar()[1]),
+                    "annee": int(date_obj.year), "canal": "Sur place",
+                    "ca_ht": ca_ht, "tva": round(ca_ttc - ca_ht, 2),
+                    "ca_ttc": round(ca_ttc, 2), "nb_couverts": 0, "nb_commandes": 0,
+                    "lignes": [], "source": "tiller", "created_at": str(today)
+                }, merge=True)
+                synced += 1
+            return {"success": True, "message": f"{synced} jour(s) synchronisé(s) depuis Tiller."}
+
+        if pos_id == "zelty":
+            api_token = creds.get("api_token", "")
+            ok, code, data = _pos_request(
+                "GET", "https://backoffice.zelty.fr/api/2/stats/daily",
+                headers={"Authorization": f"Token {api_token}"},
+                params={"start": depuis, "end": str(today)}
+            )
+            if not ok:
+                return {"success": False, "message": f"Erreur {code}."}
+            for row in (data if isinstance(data, list) else data.get("results", [])):
+                d = str(row.get("date", ""))[:10]
+                if not d:
+                    continue
+                date_obj = _dt.date.fromisoformat(d)
+                ca_ht = float(row.get("revenue_ht", 0) or 0)
+                ca_ttc = float(row.get("revenue_ttc", 0) or 0)
+                _db.collection(COLLECTION_VENTES).document(f"zelty_{d}").set({
+                    "date": d, "semaine": int(date_obj.isocalendar()[1]),
+                    "annee": int(date_obj.year), "canal": "Sur place",
+                    "ca_ht": round(ca_ht, 2), "tva": round(ca_ttc - ca_ht, 2),
+                    "ca_ttc": round(ca_ttc, 2),
+                    "nb_couverts": int(row.get("nb_couverts", 0) or 0),
+                    "nb_commandes": int(row.get("nb_tickets", 0) or 0),
+                    "lignes": [], "source": "zelty", "created_at": str(today)
+                }, merge=True)
+                synced += 1
+            return {"success": True, "message": f"{synced} jour(s) synchronisé(s) depuis Zelty."}
+
+        if pos_id == "ubereats":
+            client_id = creds.get("client_id", "")
+            client_secret = creds.get("client_secret", "")
+            store_id = creds.get("store_id", "")
+            import requests as _req
+            token_resp = _req.post(
+                "https://login.uber.com/oauth/v2/token",
+                data={"client_id": client_id, "client_secret": client_secret,
+                      "grant_type": "client_credentials", "scope": "eats.report"},
+                timeout=8
+            )
+            if token_resp.status_code != 200:
+                return {"success": False, "message": "Impossible d'obtenir le token Uber Eats."}
+            access_token = token_resp.json().get("access_token", "")
+            ok, code, data = _pos_request(
+                "GET", f"https://api.uber.com/v1/eats/report/orders/store/{store_id}",
+                headers={"Authorization": f"Bearer {access_token}"},
+                params={"start_date": depuis, "end_date": str(today)}
+            )
+            if not ok:
+                return {"success": False, "message": f"Erreur {code} Uber Eats."}
+            by_date2: dict = {}
+            for o in data.get("orders", []):
+                d = str(o.get("created_at", ""))[:10]
+                total = float(o.get("total", {}).get("price", 0)) / 100
+                entry = by_date2.setdefault(d, {"ca_ttc": 0.0, "nb": 0})
+                entry["ca_ttc"] += total
+                entry["nb"] += 1
+            for d, vals in by_date2.items():
+                date_obj = _dt.date.fromisoformat(d)
+                ca_ttc = vals["ca_ttc"]
+                ca_ht = round(ca_ttc / 1.055, 2)
+                _db.collection(COLLECTION_VENTES).document(f"ubereats_{d}").set({
+                    "date": d, "semaine": int(date_obj.isocalendar()[1]),
+                    "annee": int(date_obj.year), "canal": "Livraison",
+                    "ca_ht": ca_ht, "tva": round(ca_ttc - ca_ht, 2),
+                    "ca_ttc": round(ca_ttc, 2), "nb_couverts": 0,
+                    "nb_commandes": int(vals["nb"]),
+                    "lignes": [], "source": "ubereats", "created_at": str(today)
+                }, merge=True)
+                synced += 1
+            return {"success": True, "message": f"{synced} jour(s) Uber Eats synchronisé(s)."}
+
+        return {"success": False, "message": "Synchronisation non disponible pour ce POS."}
+
+    except Exception as e:
+        return {"success": False, "message": f"Erreur : {e}"}
+
+
 # --- EMOJIS MAPPING ---
 POSTES_EMOJIS = {
     "Dashboard Global": "🌍 Dashboard Global",
@@ -618,7 +825,8 @@ POSTES_EMOJIS = {
     "Fiches Techniques": "📖 Fiches Techniques",
     "Factures": "🧾 Factures",
     "Saisie de données": "✏️ Saisie de données",
-    "Ventes & CA": "💰 Ventes & CA"
+    "Ventes & CA": "💰 Ventes & CA",
+    "Intégrations": "🔌 Intégrations",
 }
 
 OBJECTIF_EURO_KG = 0.70
@@ -722,6 +930,36 @@ page = st.sidebar.radio(
     list(POSTES_EMOJIS.keys()),
     format_func=lambda x: POSTES_EMOJIS.get(x, x)
 )
+
+st.sidebar.divider()
+st.sidebar.subheader("📥 Exporter des données")
+
+@st.cache_data(show_spinner=False)
+def generate_csv_zip(file_path):
+    import os, io, zipfile, pandas as pd
+    if not os.path.exists(file_path):
+        return None
+    try:
+        dfs = pd.read_excel(file_path, sheet_name=None)
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+            for sheet_name, df in dfs.items():
+                safe_name = sheet_name.replace("/", "_").replace("\\", "_")
+                zf.writestr(f"Suivi_heures_mep_{safe_name}.csv", df.to_csv(index=False).encode('utf-8'))
+        return zip_buffer.getvalue()
+    except Exception as e:
+        st.sidebar.error(f"Erreur d'export: {e}")
+        return None
+
+zip_data = generate_csv_zip("Suivi heures mep.xlsx")
+if zip_data:
+    st.sidebar.download_button(
+        label="Extraire tous les onglets en CSV (ZIP)",
+        data=zip_data,
+        file_name="extractions_csv_onglets.zip",
+        mime="application/zip",
+        use_container_width=True
+    )
 # --- PAGE 1 : DASHBOARD GLOBAL ---
 if page == "Dashboard Global":
     st.title("📊 Dashboard Global Production")
