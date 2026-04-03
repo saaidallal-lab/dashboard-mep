@@ -827,6 +827,7 @@ POSTES_EMOJIS = {
     "Saisie de données": "✏️ Saisie de données",
     "Ventes & CA": "💰 Ventes & CA",
     "Intégrations": "🔌 Intégrations",
+    "Mes Apps": "📱 Mes Apps",
 }
 
 OBJECTIF_EURO_KG = 0.70
@@ -2855,3 +2856,113 @@ elif page == "Intégrations":
                     + "  |  ".join(f"{icon} {nom}" for icon, nom in actives))
     else:
         st.info("Aucune intégration connectée. Configurez vos outils ci-dessus pour importer vos ventes automatiquement.")
+
+# ─────────────────────────────────────────────────────────
+# PAGE : MES APPS
+# ─────────────────────────────────────────────────────────
+elif page == "Mes Apps":
+    st.title("📱 Mes Applications")
+    st.caption("Tous vos outils au même endroit.")
+
+    # ── Définition des apps ───────────────────────────────
+    APPS = [
+        {
+            "nom": "Carte Fidélité",
+            "icon": "🎁",
+            "desc": "Programme de fidélité client — gestion des points, récompenses et historique.",
+            "techno": "React · Gemini AI",
+            "url": "https://ai.studio/apps/db088479-27fb-490e-863c-bc26ca729bc8",
+            "color": "#7C3AED",
+            "statut": "En ligne",
+        },
+        {
+            "nom": "Restau 360",
+            "icon": "🍽️",
+            "desc": "Vue complète de la gestion restaurant — opérations, équipe, stocks.",
+            "techno": "—",
+            "url": "",  # À renseigner
+            "color": "#EA580C",
+            "statut": "URL à configurer",
+        },
+        {
+            "nom": "Formation",
+            "icon": "🎓",
+            "desc": "Suivi des formations du personnel — HACCP, certifications, plannings.",
+            "techno": "—",
+            "url": "",  # À renseigner
+            "color": "#0284C7",
+            "statut": "URL à configurer",
+        },
+        {
+            "nom": "Dashboard MEP",
+            "icon": "📊",
+            "desc": "Suivi de la production en cuisine — KPIs, fiches techniques, ventes.",
+            "techno": "Python · Streamlit",
+            "url": "",  # URL de ce dashboard
+            "color": "#16A34A",
+            "statut": "Cette app",
+        },
+    ]
+
+    # CSS commun pour les cartes
+    st.markdown("""
+    <style>
+    .app-card {
+        border-radius: 16px;
+        padding: 22px 20px 18px;
+        margin-bottom: 6px;
+        transition: transform .15s;
+    }
+    .app-card:hover { transform: translateY(-2px); }
+    .app-tag {
+        display: inline-block;
+        background: rgba(255,255,255,0.25);
+        color: white;
+        font-size: 0.7em;
+        font-weight: 600;
+        padding: 2px 9px;
+        border-radius: 12px;
+        margin-top: 6px;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    # Affichage 2 par ligne
+    for i in range(0, len(APPS), 2):
+        cols = st.columns(2, gap="large")
+        for j, app in enumerate(APPS[i:i+2]):
+            with cols[j]:
+                has_url = bool(app["url"])
+                statut_color = "#22C55E" if app["statut"] == "En ligne" else \
+                               "#94A3B8" if app["statut"] == "URL à configurer" else "#3B82F6"
+
+                st.markdown(f"""
+<div class="app-card" style="background:linear-gradient(135deg,{app['color']},{app['color']}CC);
+     border: none; box-shadow: 0 6px 20px {app['color']}44;">
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;">
+    <span style="font-size:2.2rem;line-height:1">{app['icon']}</span>
+    <span style="background:rgba(255,255,255,0.2);color:white;padding:3px 10px;
+                 border-radius:20px;font-size:0.72em;font-weight:700;">{app['statut']}</span>
+  </div>
+  <div style="color:white;font-size:1.1rem;font-weight:700;margin:10px 0 4px">{app['nom']}</div>
+  <div style="color:rgba(255,255,255,0.85);font-size:0.82em;line-height:1.4">{app['desc']}</div>
+  {f'<span class="app-tag">{app["techno"]}</span>' if app["techno"] != "—" else ""}
+</div>""", unsafe_allow_html=True)
+
+                if has_url and app["statut"] != "Cette app":
+                    st.link_button(f"Ouvrir {app['nom']} →", app["url"], use_container_width=True)
+                elif app["statut"] == "Cette app":
+                    st.button("✅ Vous êtes ici", disabled=True, use_container_width=True, key=f"here_{i}_{j}")
+                else:
+                    st.button("🔗 URL à renseigner", disabled=True, use_container_width=True, key=f"todo_{i}_{j}")
+
+    # ── Section "Ajouter une app" ─────────────────────────
+    st.divider()
+    with st.expander("➕ Ajouter / modifier une app dans cette page"):
+        st.info(
+            "Pour ajouter ou modifier une app, transmettez à votre développeur :\n"
+            "- Le **nom** de l'app\n"
+            "- L'**URL** de déploiement\n"
+            "- Une **description** courte\n\n"
+            "Les apps sont configurées directement dans le code (`APPS` liste dans la page 'Mes Apps')."
+        )
